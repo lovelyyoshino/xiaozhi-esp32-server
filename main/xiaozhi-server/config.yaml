@@ -89,9 +89,8 @@ module_test:
 
 # 唤醒词，用于识别唤醒词还是讲话内容
 wakeup_words:
-  - "你好小智"
-  - "嘿你好呀"
-  - "你好小志"
+  - "你好小黑"
+  - "你好大黄"
   - "小爱同学"
   - "你好小鑫"
   - "你好小新"
@@ -111,6 +110,9 @@ plugins:
   # 申请地址：https://console.qweather.com/#/apps/create-key/over
   # 申请后通过这个链接可以找到自己的apihost：https://console.qweather.com/setting?lang=zh
   get_weather: {"api_host":"mj7p3y7naa.re.qweatherapi.com", "api_key": "a861d0d5e7bf4ee1a83d9a9e4f96d4da", "default_location": "广州" }
+  # 获取附近场所信息插件配置，这里填写你的高德地图API密钥
+  # 申请地址：https://lbs.amap.com/dev/key/app
+  get_place_info: {"api_key": "1ba9b66a094a5a86b22e6c7425a4f33b", "default_city": "上海" }
   # 获取新闻插件的配置，这里根据需要的新闻类型传入对应的url链接，默认支持社会、科技、财经新闻
   # 更多类型的新闻列表查看 https://www.chinanews.com.cn/rss/
   get_news_from_chinanews:
@@ -211,6 +213,7 @@ Intent:
       - get_weather
       - get_news_from_newsnow
       - play_music
+      - get_place_info
   function_call:
     # 不需要动type
     type: function_call
@@ -220,8 +223,8 @@ Intent:
     functions:
       - change_role
       - get_weather
-      # - get_news_from_chinanews
       - get_news_from_newsnow
+      - get_place_info
       # play_music是服务器自带的音乐播放，hass_play_music是通过home assistant控制的独立外部程序音乐播放
       # 如果用了hass_play_music，就不要开启play_music，两者只留一个
       - play_music
@@ -871,7 +874,7 @@ TTS:
       stream: false
     headers: # 自定义请求头
       # Authorization: Bearer xxxx
-    format: mp3 # 接口返回的音频格式
+    format: wav # 接口返回的音频格式
     output_dir: tmp/
   LinkeraiTTS:
     type: linkerai
