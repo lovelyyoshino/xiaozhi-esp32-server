@@ -2,24 +2,29 @@ import json
 import asyncio
 import uuid
 from core.handle.sendAudioHandle import send_stt_message
-from core.handle.helloHandle import checkWakeupWords
 from core.utils.util import remove_punctuation_and_length
 from core.providers.tts.dto.dto import ContentType
 from core.utils.dialogue import Message
-from core.handle.mcpHandle import call_mcp_tool
 from plugins_func.register import Action, ActionResponse
-from loguru import logger
+from core.providers.tts.dto.dto import TTSMessageDTO, SentenceType
 
 TAG = __name__
 
 
 async def handle_user_intent(conn, text):
+    # 预处理输入文本，处理可能的JSON格式
+    try:
+        if text.strip().startswith('{') and text.strip().endswith('}'):
+            parsed_data = json.loads(text)
+            if isinstance(parsed_data, dict) and "content" in parsed_data:
+                text = parsed_data["content"]  # 提取content用于意图分析
+                conn.current_speaker = parsed_data.get("speaker")  # 保留说话人信息
+    except (json.JSONDecodeError, TypeError):
+        pass
+
     # 检查是否有明确的退出命令
     filtered_text = remove_punctuation_and_length(text)[1]
     if await check_direct_exit(conn, filtered_text):
-        return True
-    # 检查是否是唤醒词
-    if await checkWakeupWords(conn, filtered_text):
         return True
 
     if conn.intent_type == "function_call":
@@ -29,6 +34,8 @@ async def handle_user_intent(conn, text):
     intent_result = await analyze_intent_with_llm(conn, text)
     if not intent_result:
         return False
+    # 会话开始时生成sentence_id
+    conn.sentence_id = str(uuid.uuid4().hex)
     # 处理各种意图
     return await process_intent_result(conn, intent_result, text)
 
@@ -79,11 +86,6 @@ async def process_intent_result(conn, intent_result, original_text):
             if function_name == "continue_chat":
                 return False
 
-            if function_name == "play_music":
-                funcItem = conn.func_handler.get_function(function_name)
-                if not funcItem:
-                    conn.func_handler.function_registry.register_function("play_music")
-
             function_args = {}
             if "arguments" in intent_data["function_call"]:
                 function_args = intent_data["function_call"]["arguments"]
@@ -106,36 +108,18 @@ async def process_intent_result(conn, intent_result, original_text):
             def process_function_call():
                 conn.dialogue.put(Message(role="user", content=original_text))
 
-                # 处理Server端MCP工具调用
-                if conn.mcp_manager.is_mcp_tool(function_name):
-                    result = conn._handle_mcp_tool_call(function_call_data)
-                elif hasattr(conn, "mcp_client") and conn.mcp_client.has_tool(
-                    function_name
-                ):
-                    # 如果是小智端MCP工具调用
-                    conn.logger.bind(tag=TAG).debug(
-                        f"调用小智端MCP工具: {function_name}, 参数: {function_args}"
-                    )
-                    try:
-                        result = asyncio.run_coroutine_threadsafe(
-                            call_mcp_tool(
-                                conn, conn.mcp_client, function_name, function_args
-                            ),
-                            conn.loop,
-                        ).result()
-                        conn.logger.bind(tag=TAG).debug(f"MCP工具调用结果: {result}")
-                        result = ActionResponse(
-                            action=Action.REQLLM, result=result, response=""
-                        )
-                    except Exception as e:
-                        conn.logger.bind(tag=TAG).error(f"MCP工具调用失败: {e}")
-                        result = ActionResponse(
-                            action=Action.REQLLM, result="MCP工具调用失败", response=""
-                        )
-                else:
-                    # 处理系统函数
-                    result = conn.func_handler.handle_llm_function_call(
-                        conn, function_call_data
+                # 使用统一工具处理器处理所有工具调用
+                try:
+                    result = asyncio.run_coroutine_threadsafe(
+                        conn.func_handler.handle_llm_function_call(
+                            conn, function_call_data
+                        ),
+                        conn.loop,
+                    ).result()
+                except Exception as e:
+                    conn.logger.bind(tag=TAG).error(f"工具调用失败: {e}")
+                    result = ActionResponse(
+                        action=Action.ERROR, result=str(e), response=str(e)
                     )
 
                 if result:
@@ -176,5 +160,19 @@ async def process_intent_result(conn, intent_result, original_text):
 
 
 def speak_txt(conn, text):
+    conn.tts.tts_text_queue.put(
+        TTSMessageDTO(
+            sentence_id=conn.sentence_id,
+            sentence_type=SentenceType.FIRST,
+            content_type=ContentType.ACTION,
+        )
+    )
     conn.tts.tts_one_sentence(conn, ContentType.TEXT, content_detail=text)
+    conn.tts.tts_text_queue.put(
+        TTSMessageDTO(
+            sentence_id=conn.sentence_id,
+            sentence_type=SentenceType.LAST,
+            content_type=ContentType.ACTION,
+        )
+    )
     conn.dialogue.put(Message(role="assistant", content=text))
