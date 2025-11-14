@@ -155,7 +155,18 @@ class ASRProviderBase(ABC):
                 logger.bind(tag=TAG).info(f"识别文本: {raw_text}")
             if speaker_name:
                 logger.bind(tag=TAG).info(f"识别说话人: {speaker_name}")
-            
+
+            # 声纹验证检查
+            if conn.voiceprint_provider and conn.voiceprint_provider.require_authentication:
+                # 如果启用了强制声纹验证
+                if speaker_name == "未知说话人" or speaker_name is None:
+                    logger.bind(tag=TAG).warning(f"声纹验证失败，拒绝处理语音内容: speaker_name={speaker_name}")
+                    # 性能监控
+                    total_time = time.monotonic() - total_start_time
+                    logger.bind(tag=TAG).debug(f"总处理耗时(已拒绝): {total_time:.3f}s")
+                    self.stop_ws_connection()
+                    return  # 直接返回，不处理后续的LLM调用
+
             # 性能监控
             total_time = time.monotonic() - total_start_time
             logger.bind(tag=TAG).debug(f"总处理耗时: {total_time:.3f}s")

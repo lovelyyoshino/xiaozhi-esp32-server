@@ -124,6 +124,10 @@ plugins:
     api_host: "mj7p3y7naa.re.qweatherapi.com"
     api_key: "a861d0d5e7bf4ee1a83d9a9e4f96d4da"
     default_location: "广州"
+
+  # 获取附近场所信息插件配置，这里填写你的高德地图API密钥
+  # 申请地址：https://lbs.amap.com/dev/key/app
+  get_place_info: {"api_key": "1ba9b66a094a5a86b22e6c7425a4f33b", "default_city": "上海" }
   # 获取新闻插件的配置，这里根据需要的新闻类型传入对应的url链接，默认支持社会、科技、财经新闻
   # 更多类型的新闻列表查看 https://www.chinanews.com.cn/rss/
   get_news_from_chinanews:
@@ -168,6 +172,10 @@ voiceprint:
   # 声纹识别相似度阈值，范围0.0-1.0，默认0.4
   # 数值越高越严格，减少误识别但可能增加拒识率
   similarity_threshold: 0.4
+  # 是否强制要求声纹验证通过才处理语音
+  # true: 只处理已注册用户的语音，未知说话人的语音将被拒绝
+  # false: 所有人的语音都会被处理，声纹识别仅作为附加信息（默认）
+  require_authentication: true
 
 # #####################################################################################
 # ################################以下是角色模型配置######################################
@@ -238,6 +246,7 @@ Intent:
       - get_weather
       - get_news_from_newsnow
       - play_music
+      - get_place_info
   function_call:
     # 不需要动type
     type: function_call

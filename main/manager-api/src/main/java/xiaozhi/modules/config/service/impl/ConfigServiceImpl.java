@@ -323,6 +323,14 @@ public class ConfigServiceImpl implements ConfigService {
                 voiceprintConfig.put("similarity_threshold", 0.4);
             }
 
+            // 获取声纹识别强制验证参数，默认false
+            String requireAuthStr = sysParamsService.getValue("server.voiceprint_require_authentication", true);
+            if (StringUtils.isNotBlank(requireAuthStr) && !"null".equals(requireAuthStr)) {
+                voiceprintConfig.put("require_authentication", Boolean.parseBoolean(requireAuthStr));
+            } else {
+                voiceprintConfig.put("require_authentication", false);
+            }
+
             result.put("voiceprint", voiceprintConfig);
         } catch (Exception e) {
             // 声纹配置获取失败时不影响其他功能

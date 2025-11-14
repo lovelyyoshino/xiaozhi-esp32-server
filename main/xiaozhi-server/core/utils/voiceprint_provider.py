@@ -21,7 +21,9 @@ class VoiceprintProvider:
         self.speaker_map = self._parse_speakers()
         # 声纹识别相似度阈值，默认0.4
         self.similarity_threshold = float(config.get("similarity_threshold", 0.4))
-        
+        # 是否强制要求声纹验证通过才处理语音，默认False
+        self.require_authentication = config.get("require_authentication", False)
+
         # 解析API地址和密钥
         self.api_url = None
         self.api_key = None
@@ -64,7 +66,7 @@ class VoiceprintProvider:
                     # 进行健康检查，验证服务器是否可用
                     if self._check_server_health():
                         self.enabled = True
-                        logger.bind(tag=TAG).info(f"声纹识别已启用: API={self.api_url}, 说话人={len(self.speaker_ids)}个, 相似度阈值={self.similarity_threshold}")
+                        logger.bind(tag=TAG).info(f"声纹识别已启用: API={self.api_url}, 说话人={len(self.speaker_ids)}个, 相似度阈值={self.similarity_threshold}, 强制验证={self.require_authentication}")
                     else:
                         self.enabled = False
                         logger.bind(tag=TAG).warning(f"声纹识别服务器不可用，声纹识别已禁用: {self.api_url}")

@@ -65,7 +65,7 @@ services:
     restart: always
     networks:
       - default
-    expose:
+    ports:
       - 3306
     volumes:
       - ./mysql/data:/var/lib/mysql
