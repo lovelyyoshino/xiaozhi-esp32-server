@@ -61,6 +61,12 @@ class IntentProvider(IntentProviderBase):
             "- 询问今天农历（如：今天农历几号、今天什么节气等）\n"
             "- 询问所在城市（如：我现在在哪里、你知道我在哪个城市吗等）"
             "系统会根据上下文信息直接构建回答。\n\n"
+            "【状态通知识别】以下是机器人自身的状态通知或错误反馈，不是用户指令，请返回continue_chat：\n"
+            "- 导航状态通知（如：'即将到达XX'、'已到达XX'、'正在前往XX'、'准备导航至XX'）\n"
+            "- 任务执行状态（如：'正在执行XX'、'XX已完成'、'XX执行中'）\n"
+            "- 系统反馈信息（如：'好的，正在为您XX'、'已经帮您XX'）\n"
+            "- 错误提示信息（如：'抱歉，XX暂未录入'、'XX没有录入呢'、'建议您确认名称'、'稍后更新'、'我得先去确认一下位置'、'我马上帮你查一下'、'稍等我处理一下'）\n"
+            "这些都是机器人的状态反馈或错误提示，不需要再次执行操作。\n\n"
             "- 如果用户使用疑问词（如'怎么'、'为什么'、'如何'）询问退出相关的问题（例如'怎么退出了？'），注意这不是让你退出，请返回 {'function_call': {'name': 'continue_chat'}\n"
             "- 仅当用户明确使用'退出系统'、'结束对话'、'我不想和你说话了'等指令时，才触发 handle_exit_intent\n\n"
             "【设备名称匹配规则】当处理智能家居设备控制时：\n"
@@ -116,13 +122,49 @@ class IntentProvider(IntentProviderBase):
             "```\n"
             "用户: 你好啊\n"
             '返回: {"function_call": {"name": "continue_chat"}}\n'
+            "```\n"
+            "```\n"
+            "用户: 带我去车间\n"
+            '返回: {"function_call": {"name": "guidebot_navigateto", "arguments": {"destination": "车间", "is_user_input": true}}}\n'
+            "```\n"
+            "```\n"
+            "状态通知: 即将到达车间\n"
+            '返回: {"function_call": {"name": "continue_chat"}}\n'
+            "```\n"
+            "```\n"
+            "状态通知: 已到达车间\n"
+            '返回: {"function_call": {"name": "continue_chat"}}\n'
+            "```\n"
+            "```\n"
+            "状态通知: 好的，正在为您导航至车间，请稍等。\n"
+            '返回: {"function_call": {"name": "continue_chat"}}\n'
+            "```\n"
+            "```\n"
+            "错误反馈: 直接回复：主人，未找到该地点，你觉得xx可以吗？\n"
+            '返回: {"function_call": {"name": "continue_chat"}}\n'
+            "```\n"
+            "```\n"
+            "错误反馈: 直接回复：主人抱歉，该地点暂未录入系统。\n"
+            '返回: {"function_call": {"name": "continue_chat"}}\n'
+            "```\n"
+            "```\n"
+            "错误反馈: 抱歉，展厅暂未录入，建议您确认名称或联系管理员添加。\n"
+            '返回: {"function_call": {"name": "continue_chat"}}\n'
+            "```\n"
+            "```\n"
+            "错误反馈: 抱歉，展厅没有录入呢，稍等我处理一下~\n"
+            '返回: {"function_call": {"name": "continue_chat"}}\n'
             "```\n\n"
             "注意：\n"
             "1. 只返回JSON格式，不要包含任何其他文字\n"
             '2. 优先检查用户查询是否为基础信息（时间、日期等），如是则返回{"function_call": {"name": "result_for_context"}}，不需要arguments参数\n'
-            '3. 如果没有找到匹配的函数，返回{"function_call": {"name": "continue_chat"}}\n'
-            "4. 确保返回的JSON格式正确，包含所有必要的字段\n"
-            "5. result_for_context不需要任何参数，系统会自动从上下文获取信息\n"
+            '3. 如果是机器人的状态通知（如"即将到达"、"已到达"、"正在执行"等），返回{"function_call": {"name": "continue_chat"}}\n'
+            '4. 如果是机器人的错误反馈（如"抱歉，XX暂未录入"、"XX没有录入"、"建议您确认"等），返回{"function_call": {"name": "continue_chat"}}\n'
+            '5. 如果没有找到匹配的函数，返回{"function_call": {"name": "continue_chat"}}\n'
+            "6. 确保返回的JSON格式正确，包含所有必要的字段\n"
+            "7. result_for_context不需要任何参数，系统会自动从上下文获取信息\n"
+            "8. 区分用户主动请求（如'带我去XX'）和系统反馈（如'即将到达XX'、'抱歉XX未录入'），前者需要调用函数，后者返回continue_chat\n"
+            "9. 特别注意：以'抱歉'、'稍后'、'建议'、'我得先'、'我马上'等开头的句子通常是系统反馈，不是用户指令\n"
             "特殊说明：\n"
             "- 当用户单次输入包含多个指令时（如'打开灯并且调高音量'）\n"
             "- 请返回多个function_call组成的JSON数组\n"
