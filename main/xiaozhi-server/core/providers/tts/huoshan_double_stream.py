@@ -183,9 +183,30 @@ class TTSProvider(TTSProviderBase):
     async def _ensure_connection(self):
         """建立新的WebSocket连接，并启动监听任务（仅第一次）"""
         try:
+            # 检查现有连接是否有效
             if self.ws:
-                logger.bind(tag=TAG).info(f"使用已有链接...")
-                return self.ws
+                try:
+                    # 尝试ping检查连接是否活跃
+                    await asyncio.wait_for(self.ws.ping(), timeout=1.0)
+                    logger.bind(tag=TAG).debug(f"使用已有连接...")
+                    return self.ws
+                except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed, Exception) as e:
+                    logger.bind(tag=TAG).warning(f"现有连接无效，将重新建立: {e}")
+                    # 清理无效连接
+                    try:
+                        await self.ws.close()
+                    except:
+                        pass
+                    self.ws = None
+                    # 取消监听任务
+                    if self._monitor_task and not self._monitor_task.done():
+                        self._monitor_task.cancel()
+                        try:
+                            await self._monitor_task
+                        except asyncio.CancelledError:
+                            pass
+                        self._monitor_task = None
+
             logger.bind(tag=TAG).debug("开始建立新连接...")
             ws_header = {
                 "X-Api-App-Key": self.appId,
@@ -197,15 +218,21 @@ class TTSProvider(TTSProviderBase):
                 self.ws_url, additional_headers=ws_header, max_size=1000000000
             )
             logger.bind(tag=TAG).debug("WebSocket连接建立成功")
-            
+
             # 连接建立成功后，启动监听任务
             if self._monitor_task is None or self._monitor_task.done():
                 logger.bind(tag=TAG).debug("启动监听任务...")
                 self._monitor_task = asyncio.create_task(self._start_monitor_tts_response())
-            
+
             return self.ws
         except Exception as e:
             logger.bind(tag=TAG).error(f"建立连接失败: {str(e)}")
+            # 确保清理资源
+            if self.ws:
+                try:
+                    await self.ws.close()
+                except:
+                    pass
             self.ws = None
             raise
 
@@ -403,30 +430,51 @@ class TTSProvider(TTSProviderBase):
 
     async def close(self):
         """资源清理方法"""
+        logger.bind(tag=TAG).debug("开始清理TTS资源...")
         self.activate_session = False
+
         # 取消监听任务
         if self._monitor_task:
             try:
-                self._monitor_task.cancel()
-                await self._monitor_task
-            except asyncio.CancelledError:
-                pass
+                if not self._monitor_task.done():
+                    self._monitor_task.cancel()
+                    try:
+                        await asyncio.wait_for(self._monitor_task, timeout=2.0)
+                    except asyncio.TimeoutError:
+                        logger.bind(tag=TAG).warning("监听任务取消超时")
+                    except asyncio.CancelledError:
+                        pass
             except Exception as e:
                 logger.bind(tag=TAG).warning(f"关闭时取消监听任务错误: {e}")
-            self._monitor_task = None
+            finally:
+                self._monitor_task = None
 
+        # 关闭WebSocket连接
         if self.ws:
             try:
-                await self.ws.close()
-            except:
-                pass
-            self.ws = None
+                # 先尝试正常关闭
+                await asyncio.wait_for(self.ws.close(), timeout=2.0)
+                logger.bind(tag=TAG).debug("WebSocket连接已正常关闭")
+            except asyncio.TimeoutError:
+                logger.bind(tag=TAG).warning("WebSocket关闭超时")
+            except Exception as e:
+                logger.bind(tag=TAG).warning(f"关闭WebSocket时出错: {e}")
+            finally:
+                self.ws = None
+
+        logger.bind(tag=TAG).debug("TTS资源清理完成")
 
     async def _start_monitor_tts_response(self):
         """监听TTS响应 - 长期运行"""
+        logger.bind(tag=TAG).debug("监听任务已启动")
         try:
             while not self.conn.stop_event.is_set():
                 try:
+                    # 检查WebSocket连接是否有效
+                    if not self.ws:
+                        logger.bind(tag=TAG).warning("WebSocket连接不存在，退出监听")
+                        break
+
                     # 确保 `recv()` 运行在同一个 event loop
                     msg = await self.ws.recv()
                     res = self.parser_response(msg)
@@ -461,25 +509,35 @@ class TTSProvider(TTSProviderBase):
                         logger.bind(tag=TAG).debug(f"会话结束～～")
                         self.activate_session = False
                         self._process_before_stop_play_files()
-                except websockets.ConnectionClosed:
-                    logger.bind(tag=TAG).warning("WebSocket连接已关闭")
+                except websockets.ConnectionClosed as e:
+                    logger.bind(tag=TAG).warning(f"WebSocket连接已关闭: {e}")
                     break
+                except asyncio.CancelledError:
+                    logger.bind(tag=TAG).debug("监听任务被取消")
+                    raise  # 重新抛出以正确处理取消
                 except Exception as e:
                     logger.bind(tag=TAG).error(
-                        f"Error in _start_monitor_tts_response: {e}"
+                        f"监听TTS响应时出错: {e}"
                     )
                     traceback.print_exc()
                     break
-            # 连接异常时关闭WebSocket
+        except asyncio.CancelledError:
+            logger.bind(tag=TAG).debug("监听任务被取消（外层）")
+        except Exception as e:
+            logger.bind(tag=TAG).error(f"监听任务异常退出: {e}")
+        finally:
+            # 监听任务退出时清理资源
+            logger.bind(tag=TAG).debug("监听任务退出，清理资源...")
             if self.ws:
                 try:
                     await self.ws.close()
-                except:
-                    pass
-                self.ws = None
-        # 监听任务退出时清理引用
-        finally:
+                    logger.bind(tag=TAG).debug("监听任务中关闭WebSocket成功")
+                except Exception as e:
+                    logger.bind(tag=TAG).warning(f"监听任务中关闭WebSocket失败: {e}")
+                finally:
+                    self.ws = None
             self._monitor_task = None
+            logger.bind(tag=TAG).debug("监听任务已完全退出")
 
     async def send_event(
         self,
@@ -640,6 +698,8 @@ class TTSProvider(TTSProviderBase):
         Returns:
             list: 音频数据列表
         """
+        loop = None
+        ws = None
         try:
             # 创建事件循环
             loop = asyncio.new_event_loop()
@@ -652,6 +712,7 @@ class TTSProvider(TTSProviderBase):
             audio_data = []
 
             async def _generate_audio():
+                nonlocal ws
                 # 创建新的WebSocket连接
                 ws_header = {
                     "X-Api-App-Key": self.appId,
@@ -659,9 +720,13 @@ class TTSProvider(TTSProviderBase):
                     "X-Api-Resource-Id": self.resource_id,
                     "X-Api-Connect-Id": uuid.uuid4(),
                 }
-                ws = await websockets.connect(
-                    self.ws_url, additional_headers=ws_header, max_size=1000000000
-                )
+                try:
+                    ws = await websockets.connect(
+                        self.ws_url, additional_headers=ws_header, max_size=1000000000
+                    )
+                except Exception as conn_error:
+                    logger.bind(tag=TAG).error(f"WebSocket连接失败: {str(conn_error)}")
+                    raise
 
                 try:
                     # 启动会话
@@ -717,19 +782,42 @@ class TTSProvider(TTSProviderBase):
                         elif res.optional.event == EVENT_SessionFinished:
                             break
 
+                except Exception as e:
+                    logger.bind(tag=TAG).error(f"TTS会话处理失败: {str(e)}")
+                    raise
                 finally:
-                    # 清理资源
-                    try:
-                        await ws.close()
-                    except:
-                        pass
+                    # 确保关闭WebSocket连接
+                    if ws:
+                        try:
+                            await ws.close()
+                            logger.bind(tag=TAG).debug("WebSocket连接已关闭")
+                        except Exception as close_error:
+                            logger.bind(tag=TAG).warning(f"关闭WebSocket时出错: {close_error}")
 
             # 运行异步任务
-            loop.run_until_complete(_generate_audio())
-            loop.close()
+            try:
+                loop.run_until_complete(_generate_audio())
+            except Exception as run_error:
+                logger.bind(tag=TAG).error(f"运行异步任务失败: {str(run_error)}")
+                raise
 
             return audio_data
 
         except Exception as e:
             logger.bind(tag=TAG).error(f"生成音频数据失败: {str(e)}")
             return []
+        finally:
+            # 确保关闭事件循环
+            if loop:
+                try:
+                    # 取消所有未完成的任务
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                    # 等待所有任务取消完成
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    loop.close()
+                    logger.bind(tag=TAG).debug("事件循环已关闭")
+                except Exception as loop_error:
+                    logger.bind(tag=TAG).warning(f"关闭事件循环时出错: {loop_error}")
