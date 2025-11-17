@@ -21,9 +21,11 @@ class LLMProvider(LLMProviderBase):
         check_model_key("AliBLLLM", self.api_key)
 
     def response(self, session_id, dialogue):
+        responses = None  # 用于 finally 中安全 close
         try:
             # 处理dialogue
             if self.is_No_prompt:
+                # 去掉系统 prompt
                 dialogue.pop(0)
                 logger.bind(tag=TAG).debug(
                     f"【阿里百练API服务】处理后的dialogue: {dialogue}"
@@ -38,8 +40,10 @@ class LLMProvider(LLMProviderBase):
                 # 开启SDK原生流式
                 "stream": True,
             }
-            if self.memory_id != False:
-                # 百练memory需要prompt参数
+
+            # memory 模式处理
+            if self.memory_id is not False and self.memory_id is not None:
+                # 百练 memory 需要 prompt 参数
                 prompt = dialogue[-1].get("content")
                 call_params["memory_id"] = self.memory_id
                 call_params["prompt"] = prompt
@@ -51,6 +55,7 @@ class LLMProvider(LLMProviderBase):
             if self.base_url and ("/api/" in self.base_url):
                 dashscope.base_http_api_url = self.base_url
 
+            # 发起调用（流式）
             responses = Application.call(**call_params)
 
             # 流式处理（SDK在stream=True时返回可迭代对象；否则返回单次响应对象）
@@ -60,29 +65,40 @@ class LLMProvider(LLMProviderBase):
 
             last_text = ""
             try:
+                # 流式场景：responses 是可迭代对象
                 for resp in responses:
                     if resp.status_code != HTTPStatus.OK:
                         logger.bind(tag=TAG).error(
-                            f"code={resp.status_code}, message={resp.message}, 请参考文档：https://help.aliyun.com/zh/model-studio/developer-reference/error-code"
+                            f"code={resp.status_code}, message={resp.message}, "
+                            f"请参考文档：https://help.aliyun.com/zh/model-studio/developer-reference/error-code"
                         )
                         continue
+
                     current_text = getattr(getattr(resp, "output", None), "text", None)
                     if current_text is None:
                         continue
-                    # SDK流式为增量覆盖，计算差量输出
+
+                    # SDK 流式为“覆盖式”增量，这里做差分输出
                     if len(current_text) >= len(last_text):
                         delta = current_text[len(last_text):]
                     else:
-                        # 避免偶发回退
+                        # 避免偶发回退，直接输出当前文本
                         delta = current_text
+
                     if delta:
                         yield delta
+
                     last_text = current_text
+
             except TypeError:
                 # 非流式回落（一次性返回）
-                if responses.status_code != HTTPStatus.OK:
+                if responses is None:
+                    logger.bind(tag=TAG).error("【阿里百练API服务】responses 为空（非流式回落阶段）")
+                    yield "【阿里百练API服务响应异常】"
+                elif responses.status_code != HTTPStatus.OK:
                     logger.bind(tag=TAG).error(
-                        f"code={responses.status_code}, message={responses.message}, 请参考文档：https://help.aliyun.com/zh/model-studio/developer-reference/error-code"
+                        f"code={responses.status_code}, message={responses.message}, "
+                        f"请参考文档：https://help.aliyun.com/zh/model-studio/developer-reference/error-code"
                     )
                     yield "【阿里百练API服务响应异常】"
                 else:
@@ -94,6 +110,18 @@ class LLMProvider(LLMProviderBase):
                         chunk = full_text[i:i + self.streaming_chunk_size]
                         if chunk:
                             yield chunk
+
+            finally:
+                # ★★★ 关键修复点：无论流式/非流式，都显式关闭底层连接，防止 FD 泄漏
+                try:
+                    if responses is not None:
+                        close_fn = getattr(responses, "close", None)
+                        if callable(close_fn):
+                            close_fn()
+                except Exception as ce:
+                    logger.bind(tag=TAG).warning(
+                        f"【阿里百练API服务】关闭流式连接时出现异常: {ce}"
+                    )
 
         except Exception as e:
             logger.bind(tag=TAG).error(f"【阿里百练API服务】响应异常: {e}")
