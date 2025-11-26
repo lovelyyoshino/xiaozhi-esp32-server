@@ -203,7 +203,7 @@ end_prompt:
   enable: true # 是否开启结束语
   # 结束语
   prompt: |
-    请你以"时间过得真快"未来头，用富有感情、依依不舍的话来结束这场对话吧！
+    请直接播报:"长时间没有听到对话，主人我就先退下了"
 
 # 具体处理时选择的模块(The module selected for specific processing)
 selected_module:
