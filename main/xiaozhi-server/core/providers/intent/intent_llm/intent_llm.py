@@ -53,44 +53,18 @@ class IntentProvider(IntentProviderBase):
             functions_desc += "---\n"
 
         prompt = (
-            "【严格格式要求】你必须只能返回JSON格式，绝对不能返回任何自然语言！\n\n"
-            "你是一个意图识别助手。请分析用户的最后一句话，判断用户意图并调用相应的函数。\n\n"
-            "【重要规则】以下类型的查询请直接返回result_for_context，无需调用函数：\n"
-            "- 询问当前时间（如：现在几点、当前时间、查询时间等）\n"
-            "- 询问今天日期（如：今天几号、今天星期几、今天是什么日期等）\n"
-            "- 询问今天农历（如：今天农历几号、今天什么节气等）\n"
-            "- 询问所在城市（如：我现在在哪里、你知道我在哪个城市吗等）"
-            "系统会根据上下文信息直接构建回答。\n\n"
-            "- 如果用户使用疑问词（如'怎么'、'为什么'、'如何'）询问退出相关的问题（例如'怎么退出了？'），注意这不是让你退出，请返回 {'function_call': {'name': 'continue_chat'}\n"
-            "- 仅当用户明确使用'退出系统'、'结束对话'、'我不想和你说话了'等指令时，才触发 handle_exit_intent\n\n"
+            "你是意图识别助手，只返回JSON格式，禁止返回任何自然语言！\n\n"
+            "【核心规则】\n"
+            "1. 基础信息查询（时间/日期/农历/城市）→ result_for_context\n"
+            "2. 系统状态反馈（即将到达/已到达/正在执行/抱歉XX未录入/好的正在XX）→ continue_chat\n"
+            "3. 退出疑问（怎么退出？为什么退出？）→ continue_chat\n"
+            "4. 明确退出指令（退出系统/结束对话/不想说话了）→ handle_exit_intent\n"
+            "5. 智能家居设备：用中文名匹配，支持同义词（卫生间=厕所=洗手间，客厅=大厅，卧室=房间，书房=工作室，厨房=灶间）\n\n"
             f"{functions_desc}\n"
-            "处理步骤:\n"
-            "1. 分析用户输入，确定用户意图\n"
-            "2. 检查是否为上述基础信息查询（时间、日期等），如是则返回result_for_context\n"
-            "3. 从可用函数列表中选择最匹配的函数\n"
-            "4. 如果找到匹配的函数，生成对应的function_call 格式\n"
-            '5. 如果没有找到匹配的函数，返回{"function_call": {"name": "continue_chat"}}\n\n'
-            "返回格式要求：\n"
-            "1. 必须返回纯JSON格式，不要包含任何其他文字\n"
-            "2. 必须包含function_call字段\n"
-            "3. function_call必须包含name字段\n"
-            "4. 如果函数需要参数，必须包含arguments字段\n\n"
             "示例：\n"
             "```\n"
             "用户: 现在几点了？\n"
             '返回: {"function_call": {"name": "result_for_context"}}\n'
-            "```\n"
-            "```\n"
-            "用户: 当前电池电量是多少？\n"
-            '返回: {"function_call": {"name": "get_battery_level", "arguments": {"response_success": "当前电池电量为{value}%", "response_failure": "无法获取Battery的当前电量百分比"}}}\n'
-            "```\n"
-            "```\n"
-            "用户: 当前屏幕亮度是多少？\n"
-            '返回: {"function_call": {"name": "self_screen_get_brightness"}}\n'
-            "```\n"
-            "```\n"
-            "用户: 设置屏幕亮度为50%\n"
-            '返回: {"function_call": {"name": "self_screen_set_brightness", "arguments": {"brightness": 50}}}\n'
             "```\n"
             "```\n"
             "用户: 我想结束对话\n"
@@ -99,17 +73,43 @@ class IntentProvider(IntentProviderBase):
             "```\n"
             "用户: 你好啊\n"
             '返回: {"function_call": {"name": "continue_chat"}}\n'
+            "```\n"
+            "```\n"
+            "用户: 带我去车间\n"
+            '返回: {"function_call": {"name": "guidebot_navigateto", "arguments": {"destination": "车间", "is_user_input": true}}}\n'
+            "```\n"
+            "```\n"
+            "状态通知: 即将到达车间\n"
+            '返回: {"function_call": {"name": "continue_chat"}}\n'
+            "```\n"
+            "```\n"
+            "状态通知: 已到达车间\n"
+            '返回: {"function_call": {"name": "continue_chat"}}\n'
+            "```\n"
+            "```\n"
+            "状态通知: 好的，正在为您导航至车间，请稍等。\n"
+            '返回: {"function_call": {"name": "continue_chat"}}\n'
+            "```\n"
+            "```\n"
+            "错误反馈: 直接回复：主人，未找到该地点，你觉得xx可以吗？\n"
+            '返回: {"function_call": {"name": "continue_chat"}}\n'
+            "```\n"
+            "```\n"
+            "错误反馈: 直接回复：主人抱歉，该地点暂未录入系统。\n"
+            '返回: {"function_call": {"name": "continue_chat"}}\n'
+            "```\n"
+            "```\n"
             "```\n\n"
             "注意：\n"
             "1. 只返回JSON格式，不要包含任何其他文字\n"
             '2. 优先检查用户查询是否为基础信息（时间、日期等），如是则返回{"function_call": {"name": "result_for_context"}}，不需要arguments参数\n'
-            '3. 如果没有找到匹配的函数，返回{"function_call": {"name": "continue_chat"}}\n'
-            "4. 确保返回的JSON格式正确，包含所有必要的字段\n"
-            "5. result_for_context不需要任何参数，系统会自动从上下文获取信息\n"
-            "特殊说明：\n"
-            "- 当用户单次输入包含多个指令时（如'打开灯并且调高音量'）\n"
-            "- 请返回多个function_call组成的JSON数组\n"
-            "- 示例：{'function_calls': [{name:'light_on'}, {name:'volume_up'}]}\n\n"
+            '3. 如果是机器人的状态通知（如"即将到达"、"已到达"、"正在执行"等），返回{"function_call": {"name": "continue_chat"}}\n'
+            '4. 如果是机器人的错误反馈（如"抱歉，XX暂未录入"、"XX没有录入"、"建议您确认"等），返回{"function_call": {"name": "continue_chat"}}\n'
+            '5. 如果没有找到匹配的函数，返回{"function_call": {"name": "continue_chat"}}\n'
+            "6. 确保返回的JSON格式正确，包含所有必要的字段\n"
+            "7. result_for_context不需要任何参数，系统会自动从上下文获取信息\n"
+            "8. 区分用户主动请求（如'带我去XX'）和系统反馈（如'即将到达XX'、'抱歉XX未录入'），前者需要调用函数，后者返回continue_chat\n"
+            "9. 特别注意：以'抱歉'、'稍后'、'建议'、'我得先'、'我马上'等开头的句子通常是系统反馈，不是用户指令\n"
             "【最终警告】绝对禁止输出任何自然语言、表情符号或解释文字！只能输出有效JSON格式！违反此规则将导致系统错误！"
         )
         return prompt
@@ -168,9 +168,31 @@ class IntentProvider(IntentProviderBase):
         else:
             devices = []
         if len(devices) > 0:
-            hass_prompt = "\n下面是我家智能设备列表（位置，设备名，entity_id），可以通过homeassistant控制\n"
+            hass_prompt = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【智能家居设备列表】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+格式说明：位置,设备名,entity_id
+
+【重要】设备名称匹配注意事项：
+1. 用户输入的位置或设备名称必须与下方列表中的中文名称进行匹配
+2. 严禁将用户输入的中文翻译成英文后再匹配
+   例如：用户说"卫生间"，不要翻译成"toilet"、"bathroom"等英文词汇
+3. 支持同义词匹配：
+   - 卫生间 ≈ 厕所 ≈ 洗手间 ≈ WC
+   - 客厅 ≈ 大厅 ≈ 起居室
+   - 卧室 ≈ 房间 ≈ 睡房
+4. 支持模糊匹配：
+   - "卫生间的灯" → 匹配 "卫生间,灯"
+   - "客厅台灯" → 匹配 "客厅,台灯"
+   - "打开厕所灯" → 匹配 "卫生间,灯"
+
+设备列表：
+"""
             for device in devices:
                 hass_prompt += device + "\n"
+            hass_prompt += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             prompt_music += hass_prompt
 
         logger.bind(tag=TAG).debug(f"User prompt: {prompt_music}")

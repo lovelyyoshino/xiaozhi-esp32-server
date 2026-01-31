@@ -867,6 +867,11 @@ class ConnectionHandler:
             self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
             return None
 
+        # 检查 llm_responses 是否有效
+        if llm_responses is None:
+            self.logger.bind(tag=TAG).error(f"LLM 返回 None，无法处理响应")
+            return None
+
         # 处理流式响应
         tool_call_flag = False
         # 支持多个并行工具调用 - 使用列表存储

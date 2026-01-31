@@ -158,7 +158,9 @@ async def process_intent_result(conn, intent_result, original_text):
                             speak_txt(conn, text)
                     elif result.action == Action.REQLLM:  # 调用函数后再请求llm生成回复
                         text = result.result
-                        conn.dialogue.put(Message(role="tool", content=text))
+                        # 注意：intent_llm模式下不使用标准的function calling格式
+                        # 不应该添加role="tool"的消息，因为没有对应的tool_calls
+                        # 直接使用replyResult生成回复即可
                         llm_result = conn.intent.replyResult(text, original_text)
                         if llm_result is None:
                             llm_result = text

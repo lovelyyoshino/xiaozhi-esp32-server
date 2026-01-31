@@ -10,3 +10,4 @@ class TextMessageType(Enum):
     MCP = "mcp"
     SERVER = "server"
     PING = "ping"
+    DIRECT_TTS = "direct_tts"  # 直接TTS播报，不经过LLM

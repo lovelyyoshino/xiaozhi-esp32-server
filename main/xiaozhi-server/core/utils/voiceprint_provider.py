@@ -16,12 +16,11 @@ class VoiceprintProvider:
     """声纹识别服务提供者"""
     
     def __init__(self, config: dict):
+        self.config = config  # 保存config引用，用于动态读取参数
         self.original_url = config.get("url", "")
         self.speakers = config.get("speakers", [])
         self.speaker_map = self._parse_speakers()
-        # 声纹识别相似度阈值，默认0.4
-        self.similarity_threshold = float(config.get("similarity_threshold", 0.4))
-        
+
         # 解析API地址和密钥
         self.api_url = None
         self.api_key = None
@@ -64,11 +63,21 @@ class VoiceprintProvider:
                     # 进行健康检查，验证服务器是否可用
                     if self._check_server_health():
                         self.enabled = True
-                        logger.bind(tag=TAG).info(f"声纹识别已启用: API={self.api_url}, 说话人={len(self.speaker_ids)}个, 相似度阈值={self.similarity_threshold}")
+                        logger.bind(tag=TAG).info(f"声纹识别已启用: API={self.api_url}, 说话人={len(self.speaker_ids)}个, 相似度阈值={self.similarity_threshold}, 强制验证={self.require_authentication}")
                     else:
                         self.enabled = False
                         logger.bind(tag=TAG).warning(f"声纹识别服务器不可用，声纹识别已禁用: {self.api_url}")
     
+    @property
+    def similarity_threshold(self) -> float:
+        """动态读取声纹识别相似度阈值"""
+        return float(self.config.get("similarity_threshold", 0.4))
+
+    @property
+    def require_authentication(self) -> bool:
+        """动态读取是否强制要求声纹验证"""
+        return self.config.get("require_authentication", False)
+
     def _parse_speakers(self) -> Dict[str, Dict[str, str]]:
         """解析说话人配置"""
         speaker_map = {}
