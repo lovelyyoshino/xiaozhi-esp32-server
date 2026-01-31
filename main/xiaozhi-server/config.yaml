@@ -134,8 +134,8 @@ plugins:
   # 申请地址：https://console.qweather.com/#/apps/create-key/over
   # 申请后通过这个链接可以找到自己的apihost：https://console.qweather.com/setting?lang=zh
   get_weather:
-    api_host: "mj7p3y7naa.re.qweatherapi.com"
-    api_key: "a861d0d5e7bf4ee1a83d9a9e4f96d4da"
+    api_host: "nc6hexq6bm.re.qweatherapi.com"
+    api_key: "cad331c902c544a087668f0612f188ba"
     default_location: "广州"
 
   # 获取附近场所信息插件配置，这里填写你的高德地图API密钥
