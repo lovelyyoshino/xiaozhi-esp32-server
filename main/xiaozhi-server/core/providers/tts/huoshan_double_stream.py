@@ -584,8 +584,7 @@ class TTSProvider(TTSProviderBase):
                 except:
                     pass
                 self.ws = None
-        # 监听任务退出时清理引用
-        finally:
+            # 监听任务退出时清理引用
             self.activate_session = False
             self._monitor_task = None
             logger.bind(tag=TAG).debug("监听任务已完全退出")
