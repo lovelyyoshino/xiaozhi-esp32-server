@@ -77,6 +77,7 @@ async def analyze_intent_with_llm(conn, text):
 
 async def process_intent_result(conn, intent_result, original_text):
     """处理意图识别结果"""
+    sentence_id = conn.sentence_id
     try:
         # 尝试将结果解析为JSON
         intent_data = json.loads(intent_result)
@@ -96,6 +97,8 @@ async def process_intent_result(conn, intent_result, original_text):
                 conn.client_abort = False
                 
                 def process_context_result():
+                    if not _reply_is_current(conn, sentence_id):
+                        return
                     conn.dialogue.put(Message(role="user", content=original_text))
                     
                     from core.utils.current_time import get_current_time_info
@@ -109,8 +112,13 @@ async def process_intent_result(conn, intent_result, original_text):
 
                                         请根据以上信息回答用户的问题：{original_text}"""
                     
-                    response = conn.intent.replyResult(context_prompt, original_text)
-                    speak_txt(conn, response)
+                    _speak_result_with_role(
+                        conn,
+                        context_prompt,
+                        original_text,
+                        sentence_id,
+                        source="result_for_context",
+                    )
                 
                 conn.executor.submit(process_context_result)
                 return True
@@ -135,6 +143,8 @@ async def process_intent_result(conn, intent_result, original_text):
 
             # 使用executor执行函数调用和结果处理
             def process_function_call():
+                if not _reply_is_current(conn, sentence_id):
+                    return
                 conn.dialogue.put(Message(role="user", content=original_text))
 
                 # 使用统一工具处理器处理所有工具调用
@@ -146,32 +156,37 @@ async def process_intent_result(conn, intent_result, original_text):
                         conn.loop,
                     ).result()
                 except Exception as e:
-                    conn.logger.bind(tag=TAG).error(f"工具调用失败: {e}")
+                    conn.logger.bind(tag=TAG).error(
+                        f"工具调用失败: source={function_name}, error={type(e).__name__}"
+                    )
                     result = ActionResponse(
-                        action=Action.ERROR, result=str(e), response=str(e)
+                        action=Action.ERROR,
+                        result="The tool call failed; no result was obtained.",
                     )
 
+                if not _reply_is_current(conn, sentence_id):
+                    return
                 if result:
                     if result.action == Action.RESPONSE:  # 直接回复前端
                         text = result.response
                         if text is not None:
                             speak_txt(conn, text)
-                    elif result.action == Action.REQLLM:  # 调用函数后再请求llm生成回复
-                        text = result.result
-                        # 注意：intent_llm模式下不使用标准的function calling格式
-                        # 不应该添加role="tool"的消息，因为没有对应的tool_calls
-                        # 直接使用replyResult生成回复即可
-                        llm_result = conn.intent.replyResult(text, original_text)
-                        if llm_result is None:
-                            llm_result = text
-                        speak_txt(conn, llm_result)
-                    elif (
-                        result.action == Action.NOTFOUND
-                        or result.action == Action.ERROR
+                    elif result.action in (
+                        Action.REQLLM, Action.NOTFOUND, Action.ERROR
                     ):
-                        text = result.result
-                        if text is not None:
-                            speak_txt(conn, text)
+                        # 同时保留 result 和 response，避免丢失仅写在 response 的失败信息。
+                        # intent_llm 没有对应的 tool_calls，结果作为普通数据传给回复模型。
+                        _speak_result_with_role(
+                            conn,
+                            {
+                                "action": result.action.name,
+                                "result": result.result,
+                                "response": result.response,
+                            },
+                            original_text,
+                            sentence_id,
+                            source=function_name,
+                        )
                     elif function_name != "play_music":
                         # For backward compatibility with original code
                         # 获取当前最新的文本索引
@@ -188,6 +203,46 @@ async def process_intent_result(conn, intent_result, original_text):
     except json.JSONDecodeError as e:
         conn.logger.bind(tag=TAG).error(f"处理意图结果时出错: {e}")
         return False
+
+
+def _reply_is_current(conn, sentence_id):
+    return (
+        conn.sentence_id == sentence_id
+        and not conn.client_abort
+        and not conn.stop_event.is_set()
+    )
+
+
+def _speak_result_with_role(conn, result, original_text, sentence_id, source):
+    """按当前角色生成结果回复；失败只重试回复生成，不重复执行工具。"""
+    for attempt in range(2):
+        if not _reply_is_current(conn, sentence_id):
+            return
+        try:
+            response = conn.intent.replyResult(
+                result,
+                original_text,
+                dialogue_history=conn.dialogue.get_llm_dialogue(),
+            )
+            if isinstance(response, str) and response.strip():
+                if _reply_is_current(conn, sentence_id):
+                    speak_txt(conn, response.strip())
+                return
+            failure = "empty_or_invalid_reply"
+        except Exception as e:
+            # 模型异常可能包含 URL/凭据；只记录异常类型与请求来源。
+            failure = type(e).__name__
+        conn.logger.bind(tag=TAG).warning(
+            f"结果回复生成失败: source={source}, sentence_id={sentence_id}, "
+            f"attempt={attempt + 1}/2, error={failure}"
+        )
+
+    if _reply_is_current(conn, sentence_id):
+        conn.logger.bind(tag=TAG).error(
+            f"结束无有效内容的回复: source={source}, sentence_id={sentence_id}"
+        )
+        # STT 已发送 tts start；复用音频结束路径发送 stop，不提交空文本或原始报告。
+        conn.tts.tts_audio_queue.put((SentenceType.LAST, [], None))
 
 
 def speak_txt(conn, text):

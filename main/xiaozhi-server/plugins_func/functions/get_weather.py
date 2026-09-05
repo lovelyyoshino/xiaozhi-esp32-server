@@ -107,24 +107,52 @@ WEATHER_CODE_MAP = {
 }
 
 
+# Limit both connection establishment and stalled response reads.
+WEATHER_REQUEST_TIMEOUT = (5, 10)
+WEATHER_UNAVAILABLE_RESULT = (
+    "天气查询失败，暂时无法获取可靠的天气数据，请稍后重试。"
+    "当前天气和预报均未确认，请勿推测。"
+)
+
+
+class WeatherServiceError(RuntimeError):
+    """The upstream service failed, rather than rejecting a city name."""
+
+
 def fetch_city_info(location, api_key, api_host):
     url = f"https://{api_host}/geo/v2/city/lookup?key={api_key}&location={location}&lang=zh"
-    response = requests.get(url, headers=HEADERS).json()
-    if response.get("error") is not None:
-        logger.bind(tag=TAG).error(
-            f"获取天气失败，原因：{response.get('error', {}).get('detail')}"
-        )
+    response = requests.get(url, headers=HEADERS, timeout=WEATHER_REQUEST_TIMEOUT)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid city lookup response")
+    if payload.get("error") is not None:
+        raise WeatherServiceError("City lookup service failed")
+    code = str(payload.get("code", "200"))
+    if code == "404":
         return None
-    return response.get("location", [])[0] if response.get("location") else None
+    if code != "200":
+        raise WeatherServiceError("City lookup service failed")
+    locations = payload.get("location")
+    if not isinstance(locations, list):
+        raise ValueError("Invalid city lookup locations")
+    if not locations:
+        return None
+    if not isinstance(locations[0], dict) or not locations[0]:
+        raise ValueError("Invalid city lookup location")
+    return locations[0]
 
 
 def fetch_weather_page(url):
-    response = requests.get(url, headers=HEADERS)
+    response = requests.get(url, headers=HEADERS, timeout=WEATHER_REQUEST_TIMEOUT)
     return BeautifulSoup(response.text, "html.parser") if response.ok else None
 
 
 def parse_weather_info(soup):
-    city_name = soup.select_one("h1.c-submenu__location").get_text(strip=True)
+    city_heading = soup.select_one("h1.c-submenu__location")
+    if city_heading is None or not city_heading.get_text(strip=True):
+        raise ValueError("Weather page has no city heading")
+    city_name = city_heading.get_text(strip=True)
 
     current_abstract = soup.select_one(".c-city-weather-current .current-abstract")
     current_abstract = (
@@ -151,6 +179,8 @@ def parse_weather_info(soup):
         high_temp, low_temp = (temps[0], temps[-1]) if len(temps) >= 2 else (None, None)
         temps_list.append((date, weather, high_temp, low_temp))
 
+    if current_abstract in ("", "未知") and not current_basic and not temps_list:
+        raise ValueError("Weather page contains no weather data")
     return city_name, current_abstract, current_basic, temps_list
 
 
@@ -191,15 +221,28 @@ def get_weather(conn, location: str = None, lang: str = "zh_CN"):
         return ActionResponse(Action.REQLLM, cached_weather_report, None)
 
     # 缓存未命中，获取实时天气数据
-    city_info = fetch_city_info(location, api_key, api_host)
-    if not city_info:
-        return ActionResponse(
-            Action.REQLLM, f"未找到相关的城市: {location}，请确认地点是否正确", None
-        )
-    soup = fetch_weather_page(city_info["fxLink"])
-    if not soup:
-        return ActionResponse(Action.REQLLM, None, "请求失败")
-    city_name, current_abstract, current_basic, temps_list = parse_weather_info(soup)
+    try:
+        city_info = fetch_city_info(location, api_key, api_host)
+        if not city_info:
+            return ActionResponse(
+                Action.REQLLM, f"未找到相关的城市: {location}，请确认地点是否正确", None
+            )
+        soup = fetch_weather_page(city_info["fxLink"])
+        if soup is None:
+            raise WeatherServiceError("Weather page request failed")
+        city_name, current_abstract, current_basic, temps_list = parse_weather_info(soup)
+    except (
+        requests.RequestException,
+        WeatherServiceError,
+        ValueError,
+        TypeError,
+        KeyError,
+        AttributeError,
+        IndexError,
+    ) as exc:
+        # Request exception strings may contain URLs with API keys.
+        logger.bind(tag=TAG).warning(f"天气查询失败: {type(exc).__name__}")
+        return ActionResponse(Action.REQLLM, WEATHER_UNAVAILABLE_RESULT, None)
 
     weather_report = f"您查询的位置是：{city_name}\n\n当前天气: {current_abstract}\n"
 
