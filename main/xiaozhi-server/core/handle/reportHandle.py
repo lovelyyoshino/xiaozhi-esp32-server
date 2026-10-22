@@ -2,14 +2,23 @@
 TTS上报功能已集成到ConnectionHandler类中。
 
 上报功能包括：
-1. 每个连接对象拥有自己的上报队列和处理线程
-2. 上报线程的生命周期与连接对象绑定
-3. 使用ConnectionHandler.enqueue_tts_report方法进行上报
+1. 上报在主事件循环异步执行，全进程限制待处理数量
+2. 音频转换在线程池执行，断连时取消该连接的上报任务
+3. 使用ConnectionHandler.enqueue_report方法提交，拥塞时舍弃上报
 
 具体实现请参考core/connection.py中的相关代码。
+
+@author pony
+@date 2026-10-22
+@version v1.1.1
+@last_modified 2026-10-22
+@changelog
+    - v1.1.1 (2026-10-22): 清理音频头构造中的无用局部变量
+    - v1.1.0 (2026-10-22): 正确反映拥塞丢弃结果，并等待取消中的音频转换线程结束
 """
 
 import time
+import asyncio
 import opuslib_next
 
 from config.manage_api_client import report as manage_report
@@ -29,7 +38,20 @@ async def report(conn, type, text, opus_data, report_time):
     """
     try:
         if opus_data:
-            audio_data = opus_to_wav(conn, opus_data)
+            # 历史录音转换比实时 VAD 优先级低，只允许一个后台转换占用默认线程池。
+            async with conn._report_audio_slots:
+                conversion_task = asyncio.create_task(
+                    asyncio.to_thread(opus_to_wav, conn, opus_data)
+                )
+                try:
+                    audio_data = await asyncio.shield(conversion_task)
+                except asyncio.CancelledError:
+                    # 线程无法随协程取消；实际结束后才归还转换和上报的并发名额。
+                    try:
+                        await asyncio.shield(conversion_task)
+                    except Exception:
+                        pass
+                    raise
         else:
             audio_data = None
         # 执行异步上报
@@ -72,7 +94,6 @@ def opus_to_wav(conn, opus_data):
 
         # 创建WAV文件头
         pcm_data_bytes = b"".join(pcm_data)
-        num_samples = len(pcm_data_bytes) // 2  # 16-bit samples
 
         # WAV文件头
         wav_header = bytearray()
@@ -115,14 +136,14 @@ def enqueue_tts_report(conn, text, opus_data):
     try:
         # 使用连接对象的队列，传入文本和二进制数据而非文件路径
         if conn.chat_history_conf == 2:
-            conn.report_queue.put((2, text, opus_data, int(time.time())))
-            conn.logger.bind(tag=TAG).debug(
-                f"TTS数据已加入上报队列: {conn.device_id}, 音频大小: {len(opus_data)} "
-            )
+            accepted = conn.enqueue_report(2, text, opus_data, int(time.time()))
+            detail = f"音频包数: {len(opus_data or [])}"
         else:
-            conn.report_queue.put((2, text, None, int(time.time())))
+            accepted = conn.enqueue_report(2, text, None, int(time.time()))
+            detail = "不上报音频"
+        if accepted:
             conn.logger.bind(tag=TAG).debug(
-                f"TTS数据已加入上报队列: {conn.device_id}, 不上报音频"
+                f"TTS数据已提交上报任务: {conn.device_id}, {detail}"
             )
     except Exception as e:
         conn.logger.bind(tag=TAG).error(f"加入TTS上报队列失败: {text}, {e}")
@@ -143,14 +164,14 @@ def enqueue_asr_report(conn, text, opus_data):
     try:
         # 使用连接对象的队列，传入文本和二进制数据而非文件路径
         if conn.chat_history_conf == 2:
-            conn.report_queue.put((1, text, opus_data, int(time.time())))
-            conn.logger.bind(tag=TAG).debug(
-                f"ASR数据已加入上报队列: {conn.device_id}, 音频大小: {len(opus_data)} "
-            )
+            accepted = conn.enqueue_report(1, text, opus_data, int(time.time()))
+            detail = f"音频包数: {len(opus_data or [])}"
         else:
-            conn.report_queue.put((1, text, None, int(time.time())))
+            accepted = conn.enqueue_report(1, text, None, int(time.time()))
+            detail = "不上报音频"
+        if accepted:
             conn.logger.bind(tag=TAG).debug(
-                f"ASR数据已加入上报队列: {conn.device_id}, 不上报音频"
+                f"ASR数据已提交上报任务: {conn.device_id}, {detail}"
             )
     except Exception as e:
         conn.logger.bind(tag=TAG).debug(f"加入ASR上报队列失败: {text}, {e}")

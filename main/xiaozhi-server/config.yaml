@@ -2,7 +2,7 @@
 # 然后你想修改覆盖修改什么配置，就修改【.config.yaml】文件，而不是修改【config.yaml】文件
 # 系统会优先读取【data/.config.yaml】文件的配置，如果【.config.yaml】文件里的配置不存在，系统会自动去读取【config.yaml】文件的配置。
 # 这样做，可以最简化配置，保护您的密钥安全。
-# 如果你使用了智控台，那么以下所有配置，都不会生效，请在智控台中修改配置
+# 使用智控台时，模型配置在智控台修改；本地 server 运行预算仍会透传，请参考 config_from_api.yaml
 
 # #####################################################################################
 # #############################以下是服务器基本运行配置####################################
@@ -10,6 +10,25 @@ server:
   # 服务器监听地址和端口(Server listening address and port)
   ip: 0.0.0.0
   port: 8000
+  # 本地音频队列上限，60ms/包时 16 包约 960ms；满时背压，不主动丢弃首词
+  audio_queue_maxsize: 16
+  # short 使用本地 180ms 确认音；设备恢复收音还受播放缓冲影响，cached 保留原有问候
+  wakeup_response_mode: short
+  # 全进程管理端上报上限；满时跳过历史记录，不阻塞实时音频
+  report_max_pending: 32
+  # 所有连接共享的后台任务线程数；默认 16 作为等待云端 API 的起始预算，按实测调整
+  connection_worker_max: 16
+  # 低延迟优先：总任务预算等于线程数，不额外堆积一批云请求；满时结束本次回复
+  connection_max_pending: 16
+  # 回复提交遇到短突发时最多等待（毫秒），避免瞬时满载直接表现为无响应
+  reply_admission_wait_ms: 200
+  # 繁忙时播放本地提示音，可替换为预录的繁忙语音；空字符串只显示文字
+  reply_busy_audio: config/assets/tts_notify.mp3
+  reply_busy_text: "现在请求较多，请稍后再试。"
+  # Opus 音频关闭 WebSocket 二次压缩；需要恢复压缩时填 deflate
+  websocket_compression: null
+  # 云 TTS 返回 PCM 时的本地 Opus 编码复杂度（0–10）；4 核先用 5，音质需听测
+  tts_opus_complexity: 5
   # http服务的端口，用于简单OTA接口(单服务部署)，以及视觉分析接口
   http_port: 8003
   # 这个websocket配置是指ota接口向设备发送的websocket地址
@@ -137,10 +156,12 @@ plugins:
     api_host: "nc6hexq6bm.re.qweatherapi.com"
     api_key: "cad331c902c544a087668f0612f188ba"
     default_location: "广州"
+    # 固定场所部署建议设为 false，避免把华为云出口IP当成设备所在地
+    use_ip_location: true
 
   # 获取附近场所信息插件配置，这里填写你的高德地图API密钥
   # 申请地址：https://lbs.amap.com/dev/key/app
-  get_place_info: {"api_key": "1ba9b66a094a5a86b22e6c7425a4f33b", "default_city": "上海" }
+  get_place_info: {"api_key": "1ba9b66a094a5a86b22e6c7425a4f33b", "default_city": "上海", "use_ip_location": true }
   # 获取新闻插件的配置，这里根据需要的新闻类型传入对应的url链接，默认支持社会、科技、财经新闻
   # 更多类型的新闻列表查看 https://www.chinanews.com.cn/rss/
   get_news_from_chinanews:
@@ -522,6 +543,10 @@ ASR:
 VAD:
   SileroVAD:
     type: silero
+    # CPU-only 的初始预算；这是 PyTorch 进程级计算线程数
+    num_threads: 1
+    # 同时提交到音频线程池的推理任务数，不代表共享模型会并行执行
+    max_pending_inferences: 4
     threshold: 0.5
     threshold_low: 0.3
     model_dir: models/snakers4_silero-vad

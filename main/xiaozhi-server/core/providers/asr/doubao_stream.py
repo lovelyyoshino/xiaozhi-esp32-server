@@ -1,3 +1,15 @@
+"""豆包流式 ASR 的音频协议压缩与预录发送。
+
+@author pony
+@date 2026-10-22
+@version v1.1.1
+@last_modified 2026-10-22
+@changelog
+    - v1.1.1 (2026-10-22): 清理无格式变量的日志字符串
+    - v1.1.0 (2026-10-22): 修复短指令收尾、音频快照竞争和重复停止请求
+    - v1.0.0 (2026-10-22): 快速 gzip、握手超时、预录去重与有界空闲音频缓存
+"""
+
 import json
 import gzip
 import uuid
@@ -7,6 +19,7 @@ import opuslib_next
 from core.providers.asr.base import ASRProviderBase
 from config.logger import setup_logging
 from core.providers.asr.dto.dto import InterfaceType
+from core.providers.asr.audio_buffer import cache_voiceprint_audio, clear_voiceprint_audio
 
 TAG = __name__
 logger = setup_logging()
@@ -22,6 +35,13 @@ class ASRProvider(ASRProviderBase):
         self.asr_ws = None
         self.forward_task = None
         self.is_processing = False  # 添加处理状态标志
+        self._stop_sent = False
+        self.connect_timeout = float(config.get("connect_timeout", 5))
+        self.ready_timeout = float(config.get("ready_timeout", 5))
+        # 60ms 小包采用快速 gzip；协议仍为 gzip，可按带宽预算调整为 1–9。
+        self.gzip_compresslevel = int(config.get("gzip_compresslevel", 1))
+        if not 1 <= self.gzip_compresslevel <= 9:
+            raise ValueError("gzip_compresslevel 必须在 1–9 之间")
 
         # 配置参数
         self.appid = str(config.get("appid"))
@@ -62,27 +82,35 @@ class ASRProvider(ASRProviderBase):
     async def receive_audio(self, conn, audio, audio_have_voice):
         conn.asr_audio.append(audio)
         conn.asr_audio = conn.asr_audio[-10:]
-        # 存储音频数据
-        if not hasattr(conn, 'asr_audio_for_voiceprint'):
-            conn.asr_audio_for_voiceprint = []
-        conn.asr_audio_for_voiceprint.append(audio)
+        cache_voiceprint_audio(conn, audio, audio_have_voice)
 
         # 当没有音频数据时处理完整语音片段
-        if conn.client_listen_mode != "manual" and not audio and len(conn.asr_audio_for_voiceprint) > 0:
+        if (
+            conn.client_listen_mode != "manual"
+            and not audio
+            and getattr(conn, "_asr_voiceprint_capture_active", False)
+        ):
             await self.handle_voice_stop(conn, conn.asr_audio_for_voiceprint)
-            conn.asr_audio_for_voiceprint = []
+            clear_voiceprint_audio(conn)
 
         # 如果本次有声音，且之前没有建立连接
+        started_this_packet = False
+        current_audio_replayed = False
         if audio_have_voice and self.asr_ws is None and not self.is_processing:
             try:
                 self.is_processing = True
+                self._stop_sent = False
+                started_this_packet = True
                 # 建立新的WebSocket连接
                 headers = self.token_auth() if self.auth_method == "token" else None
-                logger.bind(tag=TAG).info(f"正在连接ASR服务，headers: {headers}")
+                logger.bind(tag=TAG).debug("正在连接豆包 ASR 服务")
 
                 self.asr_ws = await websockets.connect(
                     self.ws_url,
                     additional_headers=headers,
+                    # 音频已有协议层 gzip，再做 WebSocket deflate 会重复压缩。
+                    compression=self.config.get("websocket_compression"),
+                    open_timeout=self.connect_timeout,
                     max_size=1000000000,
                     ping_interval=None,
                     ping_timeout=None,
@@ -93,16 +121,16 @@ class ASRProvider(ASRProviderBase):
                 request_params = self.construct_request(str(uuid.uuid4()))
                 try:
                     payload_bytes = str.encode(json.dumps(request_params))
-                    payload_bytes = gzip.compress(payload_bytes)
+                    payload_bytes = gzip.compress(payload_bytes, compresslevel=self.gzip_compresslevel)
                     full_client_request = self.generate_header()
                     full_client_request.extend((len(payload_bytes)).to_bytes(4, "big"))
                     full_client_request.extend(payload_bytes)
 
-                    logger.bind(tag=TAG).info(f"发送初始化请求: {request_params}")
+                    logger.bind(tag=TAG).debug("发送豆包 ASR 初始化请求")
                     await self.asr_ws.send(full_client_request)
 
                     # 等待初始化响应
-                    init_res = await self.asr_ws.recv()
+                    init_res = await asyncio.wait_for(self.asr_ws.recv(), timeout=self.ready_timeout)
                     result = self.parse_response(init_res)
                     logger.bind(tag=TAG).info(f"收到初始化响应: {result}")
 
@@ -123,16 +151,19 @@ class ASRProvider(ASRProviderBase):
 
                 # 发送缓存的音频数据
                 if conn.asr_audio and len(conn.asr_audio) > 0:
-                    for cached_audio in conn.asr_audio[-10:]:
+                    cached_audio_frames = conn.asr_audio[-10:]
+                    for frame_index, cached_audio in enumerate(cached_audio_frames):
                         try:
                             pcm_frame = self.decoder.decode(cached_audio, 960)
-                            payload = gzip.compress(pcm_frame)
+                            payload = gzip.compress(pcm_frame, compresslevel=self.gzip_compresslevel)
                             audio_request = bytearray(
                                 self.generate_audio_default_header()
                             )
                             audio_request.extend(len(payload).to_bytes(4, "big"))
                             audio_request.extend(payload)
                             await self.asr_ws.send(audio_request)
+                            if frame_index == len(cached_audio_frames) - 1:
+                                current_audio_replayed = True
                         except Exception as e:
                             logger.bind(tag=TAG).info(
                                 f"发送缓存音频数据时发生错误: {e}"
@@ -149,10 +180,12 @@ class ASRProvider(ASRProviderBase):
                 return
 
         # 发送当前音频数据
-        if self.asr_ws and self.is_processing:
+        if self.asr_ws and self.is_processing and not self._stop_sent and not (
+            started_this_packet and current_audio_replayed
+        ):
             try:
                 pcm_frame = self.decoder.decode(audio, 960)
-                payload = gzip.compress(pcm_frame)
+                payload = gzip.compress(pcm_frame, compresslevel=self.gzip_compresslevel)
                 audio_request = bytearray(self.generate_audio_default_header())
                 audio_request.extend(len(payload).to_bytes(4, "big"))
                 audio_request.extend(payload)
@@ -163,10 +196,10 @@ class ASRProvider(ASRProviderBase):
     async def _forward_asr_results(self, conn):
         try:
             while self.asr_ws and not conn.stop_event.is_set():
-                # 获取当前连接的音频数据
-                audio_data = getattr(conn, 'asr_audio_for_voiceprint', [])
                 try:
                     response = await self.asr_ws.recv()
+                    # recv 期间音频消费者仍可能追加数据，必须在结果到达后复制快照。
+                    audio_data = list(getattr(conn, "asr_audio_for_voiceprint", []))
                     result = self.parse_response(response)
                     logger.bind(tag=TAG).debug(f"收到ASR结果: {result}")
 
@@ -179,6 +212,7 @@ class ASRProvider(ASRProviderBase):
 
                         if "result" in payload:
                             utterances = payload["result"].get("utterances", [])
+                            utterance_finished = False
                             # 检查duration和空文本的情况
                             if (
                                 not self.enable_multilingual # 注意：多语种模式不返回中间结果，需要等待最终结果
@@ -187,10 +221,10 @@ class ASRProvider(ASRProviderBase):
                                 and not payload["result"].get("text")
                                 and conn.client_listen_mode != "manual"
                             ):
-                                logger.bind(tag=TAG).error(f"识别文本：空")
+                                logger.bind(tag=TAG).error("识别文本：空")
                                 self.text = ""
-                                conn.reset_vad_states()
-                                if len(audio_data) > 15:  # 确保有足够音频数据
+                                await conn.reset_vad_states()
+                                if audio_data:
                                     await self.handle_voice_stop(conn, audio_data)
                                 break
 
@@ -205,7 +239,7 @@ class ASRProvider(ASRProviderBase):
                                     await self.handle_voice_stop(conn, audio_data)
                                     # 清理音频缓存
                                     conn.asr_audio.clear()
-                                    conn.reset_vad_states()
+                                    await conn.reset_vad_states()
                                     break
 
                             for utterance in utterances:
@@ -226,17 +260,21 @@ class ASRProvider(ASRProviderBase):
                                         if conn.client_voice_stop and len(audio_data) > 0:
                                             logger.bind(tag=TAG).debug("消息中途收到停止信号，触发处理")
                                             await self.handle_voice_stop(conn, audio_data)
+                                            utterance_finished = True
                                             # 清理音频缓存
                                             conn.asr_audio.clear()
-                                            conn.reset_vad_states()
+                                            await conn.reset_vad_states()
                                         break
                                     else:
                                         # 自动模式下直接覆盖
                                         self.text = current_text
-                                        conn.reset_vad_states()
-                                        if len(audio_data) > 15:  # 确保有足够音频数据
+                                        await conn.reset_vad_states()
+                                        if audio_data:
                                             await self.handle_voice_stop(conn, audio_data)
+                                            utterance_finished = True
                                     break
+                            if utterance_finished:
+                                break
                         elif "error" in payload:
                             error_msg = payload.get("error", "未知错误")
                             logger.bind(tag=TAG).error(f"ASR服务返回错误: {error_msg}")
@@ -264,28 +302,32 @@ class ASRProvider(ASRProviderBase):
             self.is_processing = False
             if conn:
                 if hasattr(conn, 'asr_audio_for_voiceprint'):
-                    conn.asr_audio_for_voiceprint = []
+                    clear_voiceprint_audio(conn)
                 if hasattr(conn, 'asr_audio'):
                     conn.asr_audio = []
 
     def stop_ws_connection(self):
         if self.asr_ws:
             asyncio.create_task(self.asr_ws.close())
-            self.asr_ws = None
+            # 接收任务清理前保留引用，避免旧任务收尾时误关新一轮的连接。
         self.is_processing = False
 
     async def _send_stop_request(self):
         """发送最后一个音频帧以通知服务器结束"""
-        if self.asr_ws:
+        if self.asr_ws and not self._stop_sent:
             try:
+                # 先置位，避免 stop 与 stop 并发时重复发送，且阻止后续音频继续写入。
+                self._stop_sent = True
+                self.is_processing = False
                 # 发送结束标记的音频帧（gzip压缩的空数据）
-                empty_payload = gzip.compress(b"")
+                empty_payload = gzip.compress(b"", compresslevel=self.gzip_compresslevel)
                 last_audio_request = bytearray(self.generate_last_audio_default_header())
                 last_audio_request.extend(len(empty_payload).to_bytes(4, "big"))
                 last_audio_request.extend(empty_payload)
                 await self.asr_ws.send(last_audio_request)
                 logger.bind(tag=TAG).debug("已发送结束音频帧")
             except Exception as e:
+                self._stop_sent = False
                 logger.bind(tag=TAG).debug(f"发送结束音频帧时出错: {e}")
 
     def construct_request(self, reqid):
@@ -426,6 +468,7 @@ class ASRProvider(ASRProviderBase):
                 pass
             self.forward_task = None
         self.is_processing = False
+        self._stop_sent = False
         
         # 显式释放decoder资源
         if hasattr(self, 'decoder') and self.decoder is not None:

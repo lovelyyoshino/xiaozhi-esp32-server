@@ -1,3 +1,13 @@
+"""直接播报文本，拥塞时结束设备等待状态。
+
+@author pony
+@date 2026-10-22
+@version v1.0.0
+@last_modified 2026-10-22
+@changelog
+    - v1.0.0 (2026-10-22): 将后台播报纳入共享线程及任务预算
+"""
+
 import uuid
 from typing import Dict, Any
 
@@ -53,4 +63,4 @@ class DirectTtsMessageHandler(TextMessageHandler):
             # 记录到对话历史（可选，标记为系统消息）
             conn.dialogue.put(Message(role="assistant", content=f"[直接播报] {text}"))
 
-        conn.executor.submit(process_direct_tts)
+        await conn.submit_reply(process_direct_tts)

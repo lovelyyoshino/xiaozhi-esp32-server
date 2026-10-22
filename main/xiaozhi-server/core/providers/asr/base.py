@@ -1,13 +1,22 @@
+"""ASR 有序音频消费与识别完成后的可选声纹处理。
+
+@author pony
+@date 2026-10-22
+@version v1.1.0
+@last_modified 2026-10-22
+@changelog
+    - v1.1.0 (2026-10-22): 唤醒保护期间跳过回采包，避免无效 VAD 推理
+    - v1.0.0 (2026-10-22): 使用异步消费任务与队列背压，跳过未启用声纹时的重复解码
+"""
+
 import os
 import io
 import wave
 import uuid
 import json
 import time
-import queue
 import asyncio
 import traceback
-import threading
 import opuslib_next
 from abc import ABC, abstractmethod
 from config.logger import setup_logging
@@ -27,28 +36,40 @@ class ASRProviderBase(ABC):
 
     # 打开音频通道
     async def open_audio_channels(self, conn):
-        conn.asr_priority_thread = threading.Thread(
-            target=self.asr_text_priority_thread, args=(conn,), daemon=True
+        if conn.stop_event.is_set():
+            return
+        if conn.asr_audio_task is not None and not conn.asr_audio_task.done():
+            return
+        conn.asr_audio_task = asyncio.create_task(
+            self.asr_audio_priority_task(conn),
+            name=f"asr-audio-{getattr(conn, 'device_id', None) or id(conn)}",
         )
-        conn.asr_priority_thread.start()
 
     # 有序处理ASR音频
-    def asr_text_priority_thread(self, conn):
+    async def asr_audio_priority_task(self, conn):
         while not conn.stop_event.is_set():
+            message = await conn.asr_audio_queue.get()
             try:
-                message = conn.asr_audio_queue.get(timeout=1)
-                future = asyncio.run_coroutine_threadsafe(
-                    handleAudioMessage(conn, message),
-                    conn.loop,
-                )
-                future.result()
-            except queue.Empty:
-                continue
+                if getattr(conn, "just_woken_up", False):
+                    continue
+                # 每连接顺序 await，共享有限的 asyncio 默认线程池处理本地 VAD。
+                if hasattr(conn.vad, "is_vad_async"):
+                    have_voice = await conn.vad.is_vad_async(conn, message)
+                else:
+                    have_voice = await asyncio.to_thread(
+                        conn.vad.is_vad, conn, message
+                    )
+                await handleAudioMessage(conn, message, have_voice)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.bind(tag=TAG).error(
                     f"处理ASR文本失败: {str(e)}, 类型: {type(e).__name__}, 堆栈: {traceback.format_exc()}"
                 )
                 continue
+            finally:
+                # stop 消息等待此前音频消费完毕，取消或单包失败也必须解除等待。
+                conn.asr_audio_queue.task_done()
 
     # 接收音频
     async def receive_audio(self, conn, audio, audio_have_voice):
@@ -68,7 +89,7 @@ class ASRProviderBase(ABC):
             if conn.client_voice_stop:
                 asr_audio_task = conn.asr_audio.copy()
                 conn.asr_audio.clear()
-                conn.reset_vad_states()
+                await conn.reset_vad_states()
 
                 if len(asr_audio_task) > 15:
                     await self.handle_voice_stop(conn, asr_audio_task)
@@ -79,18 +100,18 @@ class ASRProviderBase(ABC):
         try:
             total_start_time = time.monotonic()
 
-            # 准备音频数据
-            if conn.audio_format == "pcm":
-                pcm_data = asr_audio_task
-            else:
-                pcm_data = self.decode_opus(asr_audio_task)
-
-            combined_pcm_data = b"".join(pcm_data)
-
-            # 预先准备WAV数据
             wav_data = None
-            if conn.voiceprint_provider and combined_pcm_data:
-                wav_data = self._pcm_to_wav(combined_pcm_data)
+            # 云 ASR 已经拿到识别结果；只有声纹识别才需要再次解码完整语句。
+            if conn.voiceprint_provider:
+                def prepare_voiceprint_audio():
+                    pcm_data = (
+                        asr_audio_task
+                        if conn.audio_format == "pcm"
+                        else self.decode_opus(asr_audio_task)
+                    )
+                    return self._pcm_to_wav(b"".join(pcm_data))
+
+                wav_data = await asyncio.to_thread(prepare_voiceprint_audio)
 
             # 定义ASR任务
             asr_task = self.speech_to_text(asr_audio_task, conn.session_id, conn.audio_format)

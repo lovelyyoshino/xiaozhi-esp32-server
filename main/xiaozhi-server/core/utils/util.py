@@ -1,3 +1,14 @@
+"""通用工具函数，包含带超时的公网 IP 地理位置解析。
+
+@author pony
+@date 2026-10-22
+@version v1.1.1
+@last_modified 2026-10-22
+@changelog
+    - v1.1.1 (2026-10-22): 清理网络地址获取的无用异常变量
+    - v1.1.0 (2026-10-22): 私网地址跳过外部定位并限制请求超时
+"""
+
 import re
 import os
 import json
@@ -5,6 +16,7 @@ import copy
 import wave
 import socket
 import asyncio
+import ipaddress
 import requests
 import subprocess
 import numpy as np
@@ -15,6 +27,7 @@ from pydub import AudioSegment
 from typing import Callable, Any
 
 TAG = __name__
+IP_INFO_REQUEST_TIMEOUT = (3, 5)
 
 
 def get_local_ip():
@@ -25,56 +38,24 @@ def get_local_ip():
         local_ip = s.getsockname()[0]
         s.close()
         return local_ip
-    except Exception as e:
+    except Exception:
         return "127.0.0.1"
 
 
 def is_private_ip(ip_addr):
-    """
-    Check if an IP address is a private IP address (compatible with IPv4 and IPv6).
-
-    @param {string} ip_addr - The IP address to check.
-    @return {bool} True if the IP address is private, False otherwise.
-    """
+    """私网、保留及无效地址均不能用来查询设备公网位置，兼容压缩 IPv6。"""
     try:
-        # Validate IPv4 or IPv6 address format
-        if not re.match(
-            r"^(\d{1,3}\.){3}\d{1,3}$|^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$", ip_addr
-        ):
-            return False  # Invalid IP address format
-
-        # IPv4 private address ranges
-        if "." in ip_addr:  # IPv4 address
-            ip_parts = list(map(int, ip_addr.split(".")))
-            if ip_parts[0] == 10:
-                return True  # 10.0.0.0/8 range
-            elif ip_parts[0] == 172 and 16 <= ip_parts[1] <= 31:
-                return True  # 172.16.0.0/12 range
-            elif ip_parts[0] == 192 and ip_parts[1] == 168:
-                return True  # 192.168.0.0/16 range
-            elif ip_addr == "127.0.0.1":
-                return True  # Loopback address
-            elif ip_parts[0] == 169 and ip_parts[1] == 254:
-                return True  # Link-local address 169.254.0.0/16
-            else:
-                return False  # Not a private IPv4 address
-        else:  # IPv6 address
-            ip_addr = ip_addr.lower()
-            if ip_addr.startswith("fc00:") or ip_addr.startswith("fd00:"):
-                return True  # Unique Local Addresses (FC00::/7)
-            elif ip_addr == "::1":
-                return True  # Loopback address
-            elif ip_addr.startswith("fe80:"):
-                return True  # Link-local unicast addresses (FE80::/10)
-            else:
-                return False  # Not a private IPv6 address
-
-    except (ValueError, IndexError):
-        return False  # IP address format error or insufficient segments
+        return not ipaddress.ip_address(ip_addr).is_global
+    except (ValueError, TypeError):
+        return True
 
 
 def get_ip_info(ip_addr, logger):
     try:
+        # 先排除不可定位地址，避免命中旧缓存中按服务器出口推断的城市。
+        if is_private_ip(ip_addr):
+            return {"city": None}
+
         # 导入全局缓存管理器
         from core.utils.cache.manager import cache_manager, CacheType
 
@@ -83,11 +64,11 @@ def get_ip_info(ip_addr, logger):
         if cached_ip_info is not None:
             return cached_ip_info
 
-        # 缓存未命中，调用API
-        if is_private_ip(ip_addr):
-            ip_addr = ""
+        # 缓存未命中，调用API；连接和读取都设上限，避免插件线程长期占用。
         url = f"https://whois.pconline.com.cn/ipJson.jsp?json=true&ip={ip_addr}"
-        resp = requests.get(url).json()
+        response = requests.get(url, timeout=IP_INFO_REQUEST_TIMEOUT)
+        response.raise_for_status()
+        resp = response.json()
         ip_info = {"city": resp.get("city")}
 
         # 存入缓存

@@ -1,3 +1,13 @@
+"""调度意图工具及回复，使用共享后台预算并保证拥塞时结束响应。
+
+@author pony
+@date 2026-10-22
+@version v1.0.0
+@last_modified 2026-10-22
+@changelog
+    - v1.0.0 (2026-10-22): 通过连接级提交入口跟踪工具任务，拥塞时结束响应
+"""
+
 import json
 import uuid
 import asyncio
@@ -120,7 +130,7 @@ async def process_intent_result(conn, intent_result, original_text):
                         source="result_for_context",
                     )
                 
-                conn.executor.submit(process_context_result)
+                await conn.submit_reply(process_context_result)
                 return True
 
             function_args = {}
@@ -197,7 +207,7 @@ async def process_intent_result(conn, intent_result, original_text):
                             speak_txt(conn, text)
 
             # 将函数执行放在线程池中
-            conn.executor.submit(process_function_call)
+            await conn.submit_reply(process_function_call)
             return True
         return False
     except json.JSONDecodeError as e:

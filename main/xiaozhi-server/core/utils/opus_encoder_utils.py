@@ -1,6 +1,11 @@
-"""
-Opus编码工具类
-将PCM音频数据编码为Opus格式
+"""将 PCM 流编码为设备使用的 Opus 音频。
+
+@author pony
+@date 2026-10-22
+@version v1.0.0
+@last_modified 2026-10-22
+@changelog
+    - v1.0.0 (2026-10-22): 支持按 CPU 预算配置编码复杂度，保留采样率和帧格式
 """
 
 import logging
@@ -53,6 +58,14 @@ class OpusEncoderUtils:
         """重置编码器状态"""
         self.encoder.reset_state()
         self.buffer = np.array([], dtype=np.int16)
+
+    def set_complexity(self, complexity: int) -> None:
+        """在开始编码前设置复杂度；降低 CPU 消耗时需同时听测语音质量。"""
+        complexity = int(complexity)
+        if not 0 <= complexity <= 10:
+            raise ValueError("tts_opus_complexity 必须在 0–10 之间")
+        self.encoder.complexity = complexity
+        self.complexity = complexity
 
     def encode_pcm_to_opus_stream(self, pcm_data: bytes, end_of_stream: bool, callback: Callable[[Any], Any]):
         """

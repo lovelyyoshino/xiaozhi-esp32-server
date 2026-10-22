@@ -1,3 +1,14 @@
+"""讯飞流式 ASR，兼容连接的异步 VAD 状态重置。
+
+@author pony
+@date 2026-10-22
+@version v1.0.1
+@last_modified 2026-10-22
+@changelog
+    - v1.0.1 (2026-10-22): 清理未使用导入和无格式变量的日志字符串
+    - v1.0.0 (2026-10-22): 适配 VAD 状态重置的异步接口
+"""
+
 import json
 import hmac
 import base64
@@ -5,7 +16,6 @@ import hashlib
 import asyncio
 import websockets
 import opuslib_next
-import gc
 from time import mktime
 from datetime import datetime
 from urllib.parse import urlencode
@@ -238,7 +248,7 @@ class ASRProvider(ASRProviderBase):
                                 await self.handle_voice_stop(conn, audio_data)
                                 # 清理音频缓存
                                 conn.asr_audio.clear()
-                        conn.reset_vad_states()
+                        await conn.reset_vad_states()
                         break
 
                 except asyncio.TimeoutError:
@@ -277,7 +287,7 @@ class ASRProvider(ASRProviderBase):
             if self.asr_ws and self.is_processing:
                 try:
                     await self._send_audio_frame(b"", STATUS_LAST_FRAME)
-                    logger.bind(tag=TAG).debug(f"已发送停止请求")
+                    logger.bind(tag=TAG).debug("已发送停止请求")
 
                     await asyncio.sleep(0.25)
                 except Exception as e:

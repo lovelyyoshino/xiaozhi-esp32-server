@@ -1,5 +1,18 @@
+"""启动 WebSocket 服务并共享进程级上报预算。
+
+@author pony
+@date 2026-10-22
+@version v1.1.0
+@last_modified 2026-10-22
+@changelog
+    - v1.1.0 (2026-10-22): 共享连接后台线程池，限制待处理总量并在服务退出时回收
+    - v1.0.0 (2026-10-22): 增加压缩开关、上报总量限制与后台音频转换并发限制
+"""
+
 import asyncio
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import websockets
 from config.logger import setup_logging
@@ -44,6 +57,28 @@ class WebSocketServer:
         self.config = config
         self.logger = setup_logging()
         self.config_lock = asyncio.Lock()
+        server_config = self.config.get("server", {})
+        report_max_pending = int(server_config.get("report_max_pending", 32))
+        if report_max_pending < 1:
+            raise ValueError("server.report_max_pending 必须大于 0")
+        self.report_slots = threading.BoundedSemaphore(report_max_pending)
+        # 历史音频转换全进程最多一份，给默认线程池中的实时 VAD 留出计算资源。
+        self.report_audio_slots = asyncio.Semaphore(1)
+        connection_worker_max = int(server_config.get("connection_worker_max", 16))
+        if connection_worker_max < 1:
+            raise ValueError("server.connection_worker_max 必须大于 0")
+        connection_max_pending = int(
+            server_config.get("connection_max_pending", connection_worker_max)
+        )
+        if connection_max_pending < 1:
+            raise ValueError("server.connection_max_pending 必须大于 0")
+        self.connection_slots = threading.BoundedSemaphore(connection_max_pending)
+        # 所有连接共享后台线程池，避免每台设备各自创建 5 个线程。
+        # 默认 16 是初始预算；云 API 的等待时间与配额决定实际所需线程数。
+        self.connection_executor = ThreadPoolExecutor(
+            max_workers=connection_worker_max,
+            thread_name_prefix="connection-worker",
+        )
         modules = initialize_modules(
             self.logger,
             self.config,
@@ -73,10 +108,18 @@ class WebSocketServer:
         host = server_config.get("ip", "0.0.0.0")
         port = int(server_config.get("port", 8000))
 
-        async with websockets.serve(
-            self._handle_connection, host, port, process_request=self._http_response
-        ):
-            await asyncio.Future()
+        try:
+            async with websockets.serve(
+                self._handle_connection,
+                host,
+                port,
+                process_request=self._http_response,
+                # 设备音频为 Opus，跳过无效的二次压缩，降低并发连接的 CPU/内存开销。
+                compression=server_config.get("websocket_compression"),
+            ):
+                await asyncio.Future()
+        finally:
+            self.connection_executor.shutdown(wait=False, cancel_futures=True)
 
     async def _handle_connection(self, websocket):
         headers = dict(websocket.request.headers)
@@ -165,7 +208,7 @@ class WebSocketServer:
                 if new_config is None:
                     self.logger.bind(tag=TAG).error("获取新配置失败")
                     return False
-                self.logger.bind(tag=TAG).info(f"获取新配置成功")
+                self.logger.bind(tag=TAG).info("获取新配置成功")
                 # 检查 VAD 和 ASR 类型是否需要更新
                 update_vad = check_vad_update(self.config, new_config)
                 update_asr = check_asr_update(self.config, new_config)
@@ -197,7 +240,7 @@ class WebSocketServer:
                     self._intent = modules["intent"]
                 if "memory" in modules:
                     self._memory = modules["memory"]
-                self.logger.bind(tag=TAG).info(f"更新配置任务执行完毕")
+                self.logger.bind(tag=TAG).info("更新配置任务执行完毕")
                 return True
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"更新服务器配置失败: {str(e)}")

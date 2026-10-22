@@ -1,8 +1,13 @@
-"""
-系统提示词管理器模块
-负责管理和更新系统提示词，包括快速初始化和异步增强功能
-"""
+"""系统提示词管理器，支持固定部署地点下的上下文初始化。
 
+@author pony
+@date 2026-10-22
+@version v1.1.1
+@last_modified 2026-10-22
+@changelog
+    - v1.1.1 (2026-10-22): 清理无格式变量的日志字符串
+    - v1.1.0 (2026-10-22): 固定地点模式跳过公网 IP 定位
+"""
 import os
 from typing import Dict, Any
 from config.logger import setup_logging
@@ -138,6 +143,10 @@ class PromptManager:
     def _get_location_info(self, client_ip: str) -> str:
         """获取位置信息"""
         try:
+            weather_config = self.config.get("plugins", {}).get("get_weather", {})
+            if not weather_config.get("use_ip_location", True):
+                return weather_config.get("default_location", "未知位置")
+
             # 先从缓存获取
             cached_location = self.cache_manager.get(self.CacheType.LOCATION, client_ip)
             if cached_location is not None:
@@ -147,7 +156,7 @@ class PromptManager:
             from core.utils.util import get_ip_info
 
             ip_info = get_ip_info(client_ip, self.logger)
-            city = ip_info.get("city", "未知位置")
+            city = ip_info.get("city") or weather_config.get("default_location") or "未知位置"
             location = f"{city}"
 
             # 存入缓存
@@ -186,7 +195,7 @@ class PromptManager:
         try:
             local_address = ""
             if (
-                client_ip
+                (client_ip or not self.config.get("plugins", {}).get("get_weather", {}).get("use_ip_location", True))
                 and self.base_prompt_template
                 and (
                     "local_address" in self.base_prompt_template
@@ -211,7 +220,7 @@ class PromptManager:
                 else:
                     self.context_data = ""
                 
-            self.logger.bind(tag=TAG).debug(f"上下文信息更新完成")
+            self.logger.bind(tag=TAG).debug("上下文信息更新完成")
 
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"更新上下文信息失败: {e}")
@@ -231,18 +240,22 @@ class PromptManager:
             local_address = ""
             weather_info = ""
 
-            if client_ip:
+            weather_config = self.config.get("plugins", {}).get("get_weather", {})
+            if not weather_config.get("use_ip_location", True):
+                # 固定场所不复用按 IP 保存的旧城市，避免提示词与工具查询位置不一致。
+                local_address = weather_config.get("default_location", "未知位置")
+            elif client_ip:
                 # 获取位置信息（从全局缓存）
                 local_address = (
                     self.cache_manager.get(self.CacheType.LOCATION, client_ip) or ""
                 )
 
-                # 获取天气信息（从全局缓存）
-                if local_address:
-                    weather_info = (
-                        self.cache_manager.get(self.CacheType.WEATHER, local_address)
-                        or ""
-                    )
+            # 获取天气信息（从全局缓存）
+            if local_address:
+                weather_info = (
+                    self.cache_manager.get(self.CacheType.WEATHER, local_address)
+                    or ""
+                )
 
             # 替换模板变量
             template = Template(self.base_prompt_template)

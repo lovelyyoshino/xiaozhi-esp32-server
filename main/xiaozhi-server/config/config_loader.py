@@ -1,3 +1,17 @@
+"""加载本地与智控台配置，保留进程级资源预算。
+
+@author pony
+@date 2026-10-22
+@version v1.4.0
+@last_modified 2026-10-22
+@changelog
+    - v1.4.0 (2026-10-22): 透传本地短唤醒确认音模式
+    - v1.3.0 (2026-10-22): 透传回复短时等待与本地繁忙提示配置
+    - v1.2.0 (2026-10-22): 透传云 TTS 返回音频的本地 Opus 编码复杂度
+    - v1.1.0 (2026-10-22): 透传共享后台线程数和任务总量预算
+    - v1.0.0 (2026-10-22): 智控台配置透传本地音频队列、上报限额与压缩开关
+"""
+
 import os
 import yaml
 from collections.abc import Mapping
@@ -78,6 +92,21 @@ async def get_config_from_api_async(config):
             "vision_explain": config["server"].get("vision_explain", ""),
             "auth_key": config["server"].get("auth_key", ""),
         }
+        # 智控台负责模型参数；进程资源预算沿用本地 server 配置，避免静默丢失。
+        for key in (
+            "report_max_pending",
+            "websocket_compression",
+            "audio_queue_maxsize",
+            "wakeup_response_mode",
+            "connection_worker_max",
+            "connection_max_pending",
+            "reply_admission_wait_ms",
+            "reply_busy_audio",
+            "reply_busy_text",
+            "tts_opus_complexity",
+        ):
+            if key in config["server"]:
+                config_data["server"][key] = config["server"][key]
     config_data["server"]["auth"] = {"enabled": auth_enabled}
     # 如果服务器没有prompt_template，则从本地配置读取
     if not config_data.get("prompt_template"):

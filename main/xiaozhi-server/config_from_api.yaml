@@ -8,6 +8,18 @@
 server:
   ip: 0.0.0.0
   port: 8000
+  # 运行参数由本地控制，模型和密钥仍由智控台管理
+  audio_queue_maxsize: 16
+  wakeup_response_mode: short
+  report_max_pending: 32
+  connection_worker_max: 16
+  connection_max_pending: 16
+  reply_admission_wait_ms: 200
+  reply_busy_audio: config/assets/tts_notify.mp3
+  reply_busy_text: "现在请求较多，请稍后再试。"
+  websocket_compression: null
+  # 本地 PCM → Opus 编码预算；不影响云端 TTS 模型和设备协议
+  tts_opus_complexity: 5
   # http服务的端口，用于视觉分析接口
   http_port: 8003
   # 视觉分析接口地址

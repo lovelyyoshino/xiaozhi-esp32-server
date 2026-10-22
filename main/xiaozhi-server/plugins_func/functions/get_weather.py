@@ -1,3 +1,13 @@
+"""天气查询插件，支持按设备 IP 或固定部署地点取数。
+
+@author pony
+@date 2026-10-22
+@version v1.1.0
+@last_modified 2026-10-22
+@changelog
+    - v1.1.0 (2026-10-22): 增加固定地点模式并限制网络请求超时
+"""
+
 import requests
 from bs4 import BeautifulSoup
 from config.logger import setup_logging
@@ -192,12 +202,13 @@ def get_weather(conn, location: str = None, lang: str = "zh_CN"):
     api_host = weather_config.get("api_host", "mj7p3y7naa.re.qweatherapi.com")
     api_key = weather_config.get("api_key", "a861d0d5e7bf4ee1a83d9a9e4f96d4da")
     default_location = weather_config.get("default_location", "广州")
+    use_ip_location = weather_config.get("use_ip_location", True)
     client_ip = conn.client_ip
 
     # 优先使用用户提供的location参数
     if not location:
         # 通过客户端IP解析城市
-        if client_ip:
+        if use_ip_location and client_ip:
             # 先从缓存获取IP对应的城市信息
             cached_ip_info = cache_manager.get(CacheType.IP_INFO, client_ip)
             if cached_ip_info:

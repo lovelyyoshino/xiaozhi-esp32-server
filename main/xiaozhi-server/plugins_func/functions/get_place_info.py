@@ -1,7 +1,17 @@
+"""高德地点查询插件，支持固定部署地点和受限网络请求。
+
+@author pony
+@date 2026-10-22
+@version v1.1.1
+@last_modified 2026-10-22
+@changelog
+    - v1.1.1 (2026-10-22): 清理无用导入及静态字符串格式
+    - v1.1.0 (2026-10-22): 增加固定城市模式并限制网络请求超时
+"""
+
 import requests
-import json
 import re
-from typing import Dict, List, Optional, Union, Any
+from typing import Optional
 
 # 假设这些导入存在于项目中
 try:
@@ -13,6 +23,7 @@ except ImportError:
     print("警告: 部分模块导入失败，可能需要调整导入路径")
 
 TAG = __name__
+PLACE_REQUEST_TIMEOUT = (3, 8)
 
 # 尝试设置日志
 try:
@@ -104,7 +115,7 @@ class PlaceSearchService:
             ip_info = get_ip_info(client_ip, logger)
             return ip_info
         except Exception as e:
-            logger.bind(tag=TAG).error(f"获取IP信息失败: {e}")
+            logger.bind(tag=TAG).error(f"获取IP信息失败: {type(e).__name__}")
             return {}
 
     def get_location_by_name(self, location_name):
@@ -117,7 +128,7 @@ class PlaceSearchService:
         Returns:
             dict: 地点信息字典，包含经纬度等
         """
-        url = f"https://restapi.amap.com/v3/geocode/geo"
+        url = "https://restapi.amap.com/v3/geocode/geo"
         params = {
             "key": self.api_key,
             "address": location_name,
@@ -125,7 +136,10 @@ class PlaceSearchService:
         }
 
         try:
-            response = requests.get(url, params=params, headers=self.headers)
+            response = requests.get(
+                url, params=params, headers=self.headers, timeout=PLACE_REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
             data = response.json()
 
             if data.get("status") == "1" and data.get("geocodes") and len(data["geocodes"]) > 0:
@@ -137,7 +151,7 @@ class PlaceSearchService:
                     "district": data["geocodes"][0]["district"]
                 }
         except Exception as e:
-            logger.bind(tag=TAG).error(f"获取地点经纬度失败: {e}")
+            logger.bind(tag=TAG).error(f"获取地点经纬度失败: {type(e).__name__}")
 
         return None
 
@@ -168,13 +182,16 @@ class PlaceSearchService:
         }
 
         try:
-            response = requests.get(url, params=params, headers=self.headers)
+            response = requests.get(
+                url, params=params, headers=self.headers, timeout=PLACE_REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
             data = response.json()
 
             if data.get("status") == "1":
                 return data.get("pois", [])
         except Exception as e:
-            logger.bind(tag=TAG).error(f"搜索附近场所失败: {e}")
+            logger.bind(tag=TAG).error(f"搜索附近场所失败: {type(e).__name__}")
 
         return []
 
@@ -191,7 +208,7 @@ class PlaceSearchService:
         Returns:
             list: 场所信息列表
         """
-        url = "http://restapi.amap.com/v3/place/text"
+        url = "https://restapi.amap.com/v3/place/text"
         params = {
             "key": self.api_key,
             "keywords": keyword,
@@ -203,13 +220,16 @@ class PlaceSearchService:
         }
 
         try:
-            response = requests.get(url, params=params, headers=self.headers)
+            response = requests.get(
+                url, params=params, headers=self.headers, timeout=PLACE_REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
             data = response.json()
 
             if data.get("status") == "1":
                 return data.get("pois", [])
         except Exception as e:
-            logger.bind(tag=TAG).error(f"搜索城市内场所失败: {e}")
+            logger.bind(tag=TAG).error(f"搜索城市内场所失败: {type(e).__name__}")
 
         return []
 
@@ -344,7 +364,9 @@ try:
         """
         # 获取配置中的高德地图API密钥
         api_key = conn.config["plugins"].get("get_place_info", {}).get("api_key", "")
-        default_city = conn.config["plugins"].get("get_place_info", {}).get("default_city", "上海")
+        place_config = conn.config["plugins"].get("get_place_info", {})
+        default_city = place_config.get("default_city", "上海")
+        use_ip_location = place_config.get("use_ip_location", True)
 
         # 检查API密钥是否存在
         if not api_key:
@@ -385,7 +407,7 @@ try:
             places = place_service.search_places_by_keyword(lng, lat, keyword, radius)
 
         # 2. 如果没有提供location，尝试通过IP地址定位
-        elif client_ip:
+        elif use_ip_location and client_ip:
             # 获取IP对应的城市信息
             ip_info = place_service.get_location_by_ip(client_ip)
             city_name = ip_info.get("city") if ip_info and "city" in ip_info else default_city
@@ -408,4 +430,4 @@ try:
         return ActionResponse(Action.REQLLM, result_text, None)
 except Exception as e:
     # 捕获注册函数可能的异常
-    print(f"注册get_place_info函数失败: {e}") 
+    print(f"注册get_place_info函数失败: {e}")

@@ -1,3 +1,16 @@
+"""管理设备连接、音频有序消费与有界异步上报的生命周期。
+
+@author pony
+@date 2026-10-22
+@version v1.3.0
+@last_modified 2026-10-22
+@changelog
+    - v1.3.0 (2026-10-22): 保留满队列音频顺序，断连取消等待写入并记录背压次数
+    - v1.2.0 (2026-10-22): 唤醒期间过滤回采，回复短时重试并提供本地繁忙反馈
+    - v1.1.0 (2026-10-22): 共用有界后台任务预算，拥塞结束回复，断连取消自身任务
+    - v1.0.0 (2026-10-22): 隔离 VAD 状态，限制音频和上报积压，断连回收任务与资源
+"""
+
 import os
 import sys
 import copy
@@ -12,6 +25,7 @@ import subprocess
 import websockets
 
 from core.utils.util import (
+    audio_to_data,
     extract_json_from_string,
     check_vad_update,
     check_asr_update,
@@ -25,6 +39,7 @@ from core.utils.modules_initialize import (
     initialize_asr,
 )
 from core.handle.reportHandle import report
+from core.handle.sendAudioHandle import sendAudio, send_tts_message
 from core.providers.tts.default import DefaultTTS
 from concurrent.futures import ThreadPoolExecutor
 from core.utils.dialogue import Message, Dialogue
@@ -95,11 +110,27 @@ class ConnectionHandler:
         # 线程任务相关
         self.loop = None  # 在 handle_connection 中获取运行中的事件循环
         self.stop_event = threading.Event()
-        self.executor = ThreadPoolExecutor(max_workers=5)
+        shared_executor = getattr(server, "connection_executor", None)
+        self._owns_executor = shared_executor is None
+        self.executor = (
+            shared_executor
+            if not self._owns_executor
+            else ThreadPoolExecutor(max_workers=5, thread_name_prefix="connection-local")
+        )
+        self._executor_futures = set()
+        self._executor_futures_lock = threading.Lock()
+        self._connection_slots = getattr(server, "connection_slots", None)
+        if self._connection_slots is None:
+            self._connection_slots = threading.BoundedSemaphore(32)
 
-        # 添加上报线程池
-        self.report_queue = queue.Queue()
-        self.report_thread = None
+        # 上报与聊天分开调度；全进程限制运行及排队的上报数，避免慢管理端挤占回复资源。
+        self._report_slots = getattr(server, "report_slots", None)
+        if self._report_slots is None:
+            self._report_slots = threading.BoundedSemaphore(32)
+        self._report_audio_slots = getattr(server, "report_audio_slots", None)
+        if self._report_audio_slots is None:
+            self._report_audio_slots = asyncio.Semaphore(1)
+        self._report_tasks = set()
         # 未来可以通过修改此处，调节asr的上报和tts的上报，目前默认都开启
         self.report_asr_enable = self.read_config_from_api
         self.report_tts_enable = self.read_config_from_api
@@ -119,6 +150,7 @@ class ConnectionHandler:
 
         # vad相关变量
         self.client_audio_buffer = bytearray()
+        self._vad_state_lock = threading.RLock()
         self.client_have_voice = False
         self.client_voice_window = deque(maxlen=5)
         self.first_activity_time = 0.0  # 记录首次活动的时间（毫秒）
@@ -130,7 +162,17 @@ class ConnectionHandler:
         # 因为实际部署时可能会用到公共的本地ASR，不能把变量暴露给公共ASR
         # 所以涉及到ASR的变量，需要在这里定义，属于connection的私有变量
         self.asr_audio = []
-        self.asr_audio_queue = queue.Queue()
+        # 60ms 音频包下约一秒队列；满时暂停该连接接收，避免服务端无界积压。
+        audio_queue_maxsize = int(
+            self.config.get("server", {}).get("audio_queue_maxsize", 16)
+        )
+        if audio_queue_maxsize < 1:
+            raise ValueError("server.audio_queue_maxsize 必须大于 0")
+        self.asr_audio_queue = asyncio.Queue(maxsize=audio_queue_maxsize)
+        self.asr_audio_task = None
+        self._audio_queue_put_tasks = set()
+        self.audio_queue_full_count = 0
+        self._last_audio_queue_full_log = 0.0
         self.current_speaker = None  # 存储当前说话人
         self.current_language_tag = None  # 存储当前ASR识别的语言标签
 
@@ -313,6 +355,11 @@ class ConnectionHandler:
             if self.vad is None or self.asr is None:
                 return
 
+            # 唤醒提示音发送期间直接丢弃回采包，避免它们进入有序队列后在
+            # 标志位清除时又被误认为用户首句。提示音结束后立即恢复收音。
+            if getattr(self, "just_woken_up", False):
+                return
+
             # 处理来自MQTT网关的音频包
             if self.conn_from_mqtt_gateway and len(message) >= 16:
                 handled = await self._process_mqtt_audio_message(message)
@@ -320,7 +367,38 @@ class ConnectionHandler:
                     return
 
             # 不需要头部处理或没有头部时，直接处理原始消息
-            self.asr_audio_queue.put(message)
+            await self._put_audio_packet(message)
+
+    async def _put_audio_packet(self, audio_data):
+        """正常包直接入队；满时有序等待，断连负责取消等待任务。"""
+        if self.stop_event.is_set():
+            return False
+        try:
+            # 常态不创建任务或定时器，避免每个 60 ms 小包引入额外调度。
+            self.asr_audio_queue.put_nowait(audio_data)
+            return True
+        except asyncio.QueueFull:
+            self.audio_queue_full_count += 1
+            now = time.monotonic()
+            if now - self._last_audio_queue_full_log >= 5:
+                self._last_audio_queue_full_log = now
+                self.logger.bind(tag=TAG).warning(
+                    "音频队列满载，保留语音并等待消费: "
+                    f"count={self.audio_queue_full_count}, "
+                    f"maxsize={self.asr_audio_queue.maxsize}"
+                )
+
+        put_task = asyncio.create_task(self.asr_audio_queue.put(audio_data))
+        self._audio_queue_put_tasks.add(put_task)
+        try:
+            await put_task
+            return not self.stop_event.is_set()
+        except asyncio.CancelledError:
+            if self.stop_event.is_set():
+                return False
+            raise
+        finally:
+            self._audio_queue_put_tasks.discard(put_task)
 
     async def _process_mqtt_audio_message(self, message):
         """
@@ -342,12 +420,12 @@ class ConnectionHandler:
                 # 有指定长度，提取精确的音频数据
                 audio_data = message[16 : 16 + audio_length]
                 # 基于时间戳进行排序处理
-                self._process_websocket_audio(audio_data, timestamp)
+                await self._process_websocket_audio(audio_data, timestamp)
                 return True
             elif len(message) > 16:
                 # 没有指定长度或长度无效，去掉头部后处理剩余数据
                 audio_data = message[16:]
-                self.asr_audio_queue.put(audio_data)
+                await self._put_audio_packet(audio_data)
                 return True
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"解析WebSocket音频包失败: {e}")
@@ -355,7 +433,7 @@ class ConnectionHandler:
         # 处理失败，返回False表示需要继续处理
         return False
 
-    def _process_websocket_audio(self, audio_data, timestamp):
+    async def _process_websocket_audio(self, audio_data, timestamp):
         """处理WebSocket格式的音频包"""
         # 初始化时间戳序列管理
         if not hasattr(self, "audio_timestamp_buffer"):
@@ -365,7 +443,7 @@ class ConnectionHandler:
 
         # 如果时间戳是递增的，直接处理
         if timestamp >= self.last_processed_timestamp:
-            self.asr_audio_queue.put(audio_data)
+            await self._put_audio_packet(audio_data)
             self.last_processed_timestamp = timestamp
 
             # 处理缓冲区中的后续包
@@ -375,7 +453,7 @@ class ConnectionHandler:
                 for ts in sorted(self.audio_timestamp_buffer.keys()):
                     if ts > self.last_processed_timestamp:
                         buffered_audio = self.audio_timestamp_buffer.pop(ts)
-                        self.asr_audio_queue.put(buffered_audio)
+                        await self._put_audio_packet(buffered_audio)
                         self.last_processed_timestamp = ts
                         processed_any = True
                         break
@@ -384,7 +462,7 @@ class ConnectionHandler:
             if len(self.audio_timestamp_buffer) < self.max_timestamp_buffer_size:
                 self.audio_timestamp_buffer[timestamp] = audio_data
             else:
-                self.asr_audio_queue.put(audio_data)
+                await self._put_audio_packet(audio_data)
 
     async def handle_restart(self, message):
         """处理服务器重启请求"""
@@ -477,8 +555,6 @@ class ConnectionHandler:
             self._initialize_memory()
             """加载意图识别"""
             self._initialize_intent()
-            """初始化上报线程"""
-            self._init_report_threads()
             """更新系统提示词"""
             self._init_prompt_enhancement()
 
@@ -495,19 +571,6 @@ class ConnectionHandler:
         if enhanced_prompt:
             self.change_system_prompt(enhanced_prompt)
             self.logger.bind(tag=TAG).debug("系统提示词已增强更新")
-
-    def _init_report_threads(self):
-        """初始化ASR和TTS上报线程"""
-        if not self.read_config_from_api or self.need_bind:
-            return
-        if self.chat_history_conf == 0:
-            return
-        if self.report_thread is None or not self.report_thread.is_alive():
-            self.report_thread = threading.Thread(
-                target=self._report_worker, daemon=True
-            )
-            self.report_thread.start()
-            self.logger.bind(tag=TAG).info("TTS上报线程已启动")
 
     def _initialize_tts(self):
         """初始化TTS"""
@@ -559,9 +622,90 @@ class ConnectionHandler:
             # 异步获取差异化配置
             await self._initialize_private_config_async()
             # 在线程池中初始化组件
-            self.executor.submit(self._initialize_components)
+            if self.submit_background(self._initialize_components) is None:
+                # 初始化也受进程预算约束，失败时关闭连接，避免设备一直等待就绪。
+                await self.close(self.websocket)
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"后台初始化失败: {e}")
+
+    def submit_background(self, func, *args, **kwargs):
+        """非阻塞准入，限制共享池中运行及等待的任务，并跟踪连接归属。"""
+        def run_if_connected():
+            if not self.stop_event.is_set():
+                return func(*args, **kwargs)
+
+        with self._executor_futures_lock:
+            if self.stop_event.is_set() or self.executor is None:
+                return None
+            if not self._connection_slots.acquire(blocking=False):
+                # 回复会短暂重试，在最终拒绝处告警，避免每 50ms 写一条告警。
+                self.logger.bind(tag=TAG).debug("后台任务预算暂时已满")
+                return None
+            try:
+                future = self.executor.submit(run_if_connected)
+            except RuntimeError:
+                self._connection_slots.release()
+                self.logger.bind(tag=TAG).warning("后台线程池已关闭，无法提交任务")
+                return None
+            except BaseException:
+                self._connection_slots.release()
+                raise
+            self._executor_futures.add(future)
+        future.add_done_callback(self._background_task_done)
+        return future
+
+    async def submit_reply(self, func, *args, **kwargs):
+        """短暂等待任务名额；持续拥塞时本地提示，并结束设备等待状态。"""
+        loop = asyncio.get_running_loop()
+        wait_ms = int(self.config.get("server", {}).get("reply_admission_wait_ms", 200))
+        deadline = loop.time() + max(0, wait_ms) / 1000
+        future = self.submit_background(func, *args, **kwargs)
+        while future is None and not self.stop_event.is_set():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.05, remaining))
+            future = self.submit_background(func, *args, **kwargs)
+        if future is None and not self.stop_event.is_set():
+            self.logger.bind(tag=TAG).warning("回复任务持续繁忙，已发送本地反馈")
+            await self._send_busy_reply()
+        return future
+
+    async def _send_busy_reply(self):
+        """繁忙时复用本地音频缓存，不再调用云 LLM/TTS 加重拥塞。"""
+        server_config = self.config.get("server", {})
+        text = server_config.get("reply_busy_text", "现在请求较多，请稍后再试。")
+        audio_path = server_config.get("reply_busy_audio", "config/assets/tts_notify.mp3")
+        try:
+            await send_tts_message(self, "sentence_start", text)
+            if audio_path:
+                audios = await audio_to_data(audio_path)
+                if self.stop_event.is_set():
+                    return
+                self.client_abort = False
+                self.sentence_id = uuid.uuid4().hex
+                await sendAudio(self, audios)
+        except Exception as e:
+            # 提示文件缺失时仍结束设备的等待状态，不占用新的云 API 任务。
+            self.logger.bind(tag=TAG).warning(f"本地繁忙提示未能播放: {type(e).__name__}")
+        finally:
+            if not self.stop_event.is_set():
+                await send_tts_message(self, "stop")
+
+    def _background_task_done(self, future):
+        with self._executor_futures_lock:
+            self._executor_futures.discard(future)
+        self._connection_slots.release()
+        if not future.cancelled() and future.exception() is not None:
+            self.logger.bind(tag=TAG).error(
+                f"后台任务失败: {type(future.exception()).__name__}"
+            )
+
+    def _cancel_background_tasks(self):
+        with self._executor_futures_lock:
+            futures = list(self._executor_futures)
+        for future in futures:
+            future.cancel()
 
     async def _initialize_private_config_async(self):
         """从接口异步获取差异化配置（异步版本，不阻塞主循环）"""
@@ -582,7 +726,7 @@ class ConnectionHandler:
             )
             self.need_bind = False
             self.bind_completed_event.set()
-        except DeviceNotFoundException as e:
+        except DeviceNotFoundException:
             self.need_bind = True
             private_config = {}
         except DeviceBindException as e:
@@ -869,7 +1013,7 @@ class ConnectionHandler:
 
         # 检查 llm_responses 是否有效
         if llm_responses is None:
-            self.logger.bind(tag=TAG).error(f"LLM 返回 None，无法处理响应")
+            self.logger.bind(tag=TAG).error("LLM 返回 None，无法处理响应")
             return None
 
         # 处理流式响应
@@ -938,7 +1082,7 @@ class ConnectionHandler:
                                 ),
                             }
                         )
-                    except Exception as e:
+                    except Exception:
                         bHasError = True
                         response_message.append(a)
                 else:
@@ -1063,53 +1207,73 @@ class ConnectionHandler:
 
             self.chat(None, depth=depth + 1)
 
-    def _report_worker(self):
-        """聊天记录上报工作线程"""
-        while not self.stop_event.is_set():
-            try:
-                # 从队列获取数据，设置超时以便定期检查停止事件
-                item = self.report_queue.get(timeout=1)
-                if item is None:  # 检测毒丸对象
-                    break
-                try:
-                    # 检查线程池状态
-                    if self.executor is None:
-                        continue
-                    # 提交任务到线程池
-                    self.executor.submit(self._process_report, *item)
-                except Exception as e:
-                    self.logger.bind(tag=TAG).error(f"聊天记录上报线程异常: {e}")
-            except queue.Empty:
-                continue
-            except Exception as e:
-                self.logger.bind(tag=TAG).error(f"聊天记录上报工作线程异常: {e}")
+    def enqueue_report(self, report_type, text, audio_data, report_time):
+        """从音频或 TTS 线程提交上报；拥塞时舍弃本次上报，保证实时回复。"""
+        if self.stop_event.is_set() or self.loop is None:
+            return False
+        if not self._report_slots.acquire(blocking=False):
+            self.logger.bind(tag=TAG).warning("聊天记录上报繁忙，已跳过本次上报")
+            return False
+        try:
+            self.loop.call_soon_threadsafe(
+                self._schedule_report, report_type, text, audio_data, report_time
+            )
+            return True
+        except RuntimeError as e:
+            self._report_slots.release()
+            self.logger.bind(tag=TAG).warning(f"聊天记录上报任务未能提交: {e}")
+            return False
 
-        self.logger.bind(tag=TAG).info("聊天记录上报线程已退出")
+    def _schedule_report(self, report_type, text, audio_data, report_time):
+        if self.stop_event.is_set():
+            self._report_slots.release()
+            return
+        task = asyncio.create_task(
+            self._process_report(report_type, text, audio_data, report_time)
+        )
+        self._report_tasks.add(task)
+        task.add_done_callback(self._report_done)
 
-    def _process_report(self, type, text, audio_data, report_time):
+    def _report_done(self, task):
+        self._report_tasks.discard(task)
+        self._report_slots.release()
+
+    async def _process_report(self, type, text, audio_data, report_time):
         """处理上报任务"""
         try:
-            # 执行异步上报（在事件循环中运行）
-            asyncio.run(report(self, type, text, audio_data, report_time))
+            # 复用主事件循环和管理 API 的 HTTP 客户端，避免每次上报新建事件循环。
+            await report(self, type, text, audio_data, report_time)
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"上报处理异常: {e}")
-        finally:
-            # 标记任务完成
-            self.report_queue.task_done()
 
     def clearSpeakStatus(self):
         self.client_is_speaking = False
-        self.logger.bind(tag=TAG).debug(f"清除服务端讲话状态")
+        self.logger.bind(tag=TAG).debug("清除服务端讲话状态")
 
     async def close(self, ws=None):
         """资源清理方法"""
         try:
+            # 在任何 await 之前停止准入，防止断连清理期间又提交新任务。
+            with self._executor_futures_lock:
+                self.stop_event.set()
+            self._cancel_background_tasks()
+            # 必须先取消等待入队，再清空队列，否则释放空间会唤醒旧生产者，
+            # 在消费者已经退出后重新写入音频，造成残留及 queue.join 永久等待。
+            pending_puts = list(self._audio_queue_put_tasks)
+            for task in pending_puts:
+                task.cancel()
+            if pending_puts:
+                await asyncio.gather(*pending_puts, return_exceptions=True)
             # 清理音频缓冲区
             if hasattr(self, "audio_buffer"):
                 self.audio_buffer.clear()
 
             # 取消超时任务
-            if self.timeout_task and not self.timeout_task.done():
+            if (
+                self.timeout_task
+                and self.timeout_task is not asyncio.current_task()
+                and not self.timeout_task.done()
+            ):
                 self.timeout_task.cancel()
                 try:
                     await self.timeout_task
@@ -1129,6 +1293,35 @@ class ConnectionHandler:
             # 触发停止事件
             if self.stop_event:
                 self.stop_event.set()
+
+            report_tasks = list(self._report_tasks)
+            for task in report_tasks:
+                task.cancel()
+            if report_tasks:
+                await asyncio.gather(*report_tasks, return_exceptions=True)
+
+            # ASR 音频消费使用异步任务，关闭时主动取消，避免任务残留。
+            if (
+                self.asr_audio_task is not None
+                and self.asr_audio_task is not asyncio.current_task()
+            ):
+                self.asr_audio_task.cancel()
+                try:
+                    await self.asr_audio_task
+                except asyncio.CancelledError:
+                    pass
+                self.asr_audio_task = None
+
+            # 取消消费者后丢弃尚未处理的包，并解除 stop 消息对 queue.join 的等待。
+            while not self.asr_audio_queue.empty():
+                self.asr_audio_queue.get_nowait()
+                self.asr_audio_queue.task_done()
+            self.asr_audio.clear()
+            if hasattr(self, "asr_audio_for_voiceprint"):
+                self.asr_audio_for_voiceprint.clear()
+                self._asr_voiceprint_capture_active = False
+            if hasattr(self, "audio_timestamp_buffer"):
+                self.audio_timestamp_buffer.clear()
 
             # 清空任务队列
             self.clear_queues()
@@ -1172,15 +1365,31 @@ class ConnectionHandler:
             if self.tts:
                 await self.tts.close()
 
-            # 最后关闭线程池（避免阻塞）
-            if self.executor:
+            if (
+                self.asr
+                and self.asr is not self._asr
+                and hasattr(self.asr, "close")
+            ):
                 try:
-                    self.executor.shutdown(wait=False)
+                    await self.asr.close()
+                except Exception as asr_error:
+                    self.logger.bind(tag=TAG).error(
+                        f"关闭ASR资源时出错: {asr_error}"
+                    )
+
+            # 释放当前连接专属的 Opus decoder 和 VAD 流状态，避免长期连接/断连造成资源残留。
+            if self.vad and hasattr(self.vad, "release_connection"):
+                await asyncio.to_thread(self.vad.release_connection, self)
+
+            # 最后关闭线程池（避免阻塞）
+            if self.executor and self._owns_executor:
+                try:
+                    self.executor.shutdown(wait=False, cancel_futures=True)
                 except Exception as executor_error:
                     self.logger.bind(tag=TAG).error(
                         f"关闭线程池时出错: {executor_error}"
                     )
-                self.executor = None
+            self.executor = None
             self.logger.bind(tag=TAG).info("连接资源已释放")
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"关闭连接时出错: {e}")
@@ -1200,7 +1409,6 @@ class ConnectionHandler:
             for q in [
                 self.tts.tts_text_queue,
                 self.tts.tts_audio_queue,
-                self.report_queue,
             ]:
                 if not q:
                     continue
@@ -1219,10 +1427,18 @@ class ConnectionHandler:
                 f"清理结束: TTS队列大小={self.tts.tts_text_queue.qsize()}, 音频队列大小={self.tts.tts_audio_queue.qsize()}"
             )
 
-    def reset_vad_states(self):
-        self.client_audio_buffer = bytearray()
-        self.client_have_voice = False
-        self.client_voice_stop = False
+    async def reset_vad_states(self):
+        def reset():
+            with self._vad_state_lock:
+                self.client_audio_buffer = bytearray()
+                self.client_have_voice = False
+                self.client_voice_stop = False
+                self.client_voice_window.clear()
+                self.last_is_voice = False
+                if self.vad and hasattr(self.vad, "reset_connection"):
+                    self.vad.reset_connection(self)
+
+        await asyncio.to_thread(reset)
         self.logger.bind(tag=TAG).debug("VAD states reset.")
 
     def chat_and_close(self, text):

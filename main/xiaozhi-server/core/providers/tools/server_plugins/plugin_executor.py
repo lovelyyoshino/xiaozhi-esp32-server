@@ -1,8 +1,26 @@
-"""服务端插件工具执行器"""
+"""服务端插件工具执行器，为天气和地点查询隔离阻塞网络请求。
 
+@author pony
+@date 2026-10-22
+@version v1.0.0
+@last_modified 2026-10-22
+@changelog
+    - v1.0.0 (2026-10-22): 网络插件使用全进程有界专用线程池，取消时按实际任务回收名额
+"""
+
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any
 from ..base import ToolType, ToolDefinition, ToolExecutor
 from plugins_func.register import all_function_registry, Action, ActionResponse
+
+
+# 只迁移已确认的同步网络插件；控制类插件可能需要在事件循环线程操作连接。
+# 专用线程池不与 VAD 共用默认 executor，总预算包含正在运行和等待的请求。
+_NETWORK_TOOLS = frozenset({"get_weather", "get_place_info"})
+_NETWORK_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="location-api")
+_NETWORK_TOOL_SLOTS = threading.BoundedSemaphore(8)
 
 
 class ServerPluginExecutor(ToolExecutor):
@@ -23,6 +41,21 @@ class ServerPluginExecutor(ToolExecutor):
             )
 
         try:
+            if tool_name in _NETWORK_TOOLS:
+                slots = _NETWORK_TOOL_SLOTS
+                if not slots.acquire(blocking=False):
+                    return ActionResponse(
+                        action=Action.ERROR, response="天气或地点查询繁忙，请稍后重试。"
+                    )
+                try:
+                    future = _NETWORK_TOOL_EXECUTOR.submit(func_item.func, conn, **arguments)
+                except BaseException:
+                    slots.release()
+                    raise
+                # await 被取消时，正在执行的 requests 仍可能未退出，不能提前释放名额。
+                future.add_done_callback(lambda _: slots.release())
+                return await asyncio.wrap_future(future)
+
             # 根据工具类型决定如何调用
             if hasattr(func_item, "type"):
                 func_type = func_item.type

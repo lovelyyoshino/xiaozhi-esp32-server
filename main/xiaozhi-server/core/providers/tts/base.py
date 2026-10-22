@@ -1,3 +1,13 @@
+"""调度云语音合成并将结果编码、发送到设备。
+
+@author pony
+@date 2026-10-22
+@version v1.0.0
+@last_modified 2026-10-22
+@changelog
+    - v1.0.0 (2026-10-22): 开通音频通道时应用本地 Opus 编码复杂度预算
+"""
+
 import os
 import re
 import uuid
@@ -262,6 +272,11 @@ class TTSProviderBase(ABC):
             self.opus_encoder = opus_encoder_utils.OpusEncoderUtils(
                 sample_rate=conn.sample_rate, channels=1, frame_size_ms=60
             )
+
+        # 云 TTS 返回 PCM 时仍需本地编码；也覆盖子类预建的编码器，保留其采样率。
+        self.opus_encoder.set_complexity(
+            conn.config.get("server", {}).get("tts_opus_complexity", 10)
+        )
 
         # tts 消化线程
         self.tts_priority_thread = threading.Thread(

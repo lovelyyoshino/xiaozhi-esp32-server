@@ -1,3 +1,14 @@
+"""处理监听控制消息，并保证停止前音频已消费完成。
+
+@author pony
+@date 2026-10-22
+@version v1.1.0
+@last_modified 2026-10-22
+@changelog
+    - v1.1.0 (2026-10-22): 使用实际唤醒词命中缓存，普通识别不再开启唤醒屏蔽
+    - v1.0.0 (2026-10-22): stop 等待有界音频队列，异步重置 VAD 状态
+"""
+
 import time
 import asyncio
 from typing import Dict, Any
@@ -29,6 +40,11 @@ class ListenTextMessageHandler(TextMessageHandler):
             conn.client_have_voice = True
             conn.client_voice_stop = False
         elif msg_json["state"] == "stop":
+            # WebSocket 中 stop 排在音频后面，但音频还可能在异步消费者中等待 VAD。
+            # 先完成这些包，防止 finish-task 提前发送或手动录音漏掉句尾。
+            await conn.asr_audio_queue.join()
+            if conn.stop_event.is_set():
+                return
             conn.client_have_voice = True
             conn.client_voice_stop = True
             if conn.asr.interface_type == InterfaceType.STREAM:
@@ -39,7 +55,7 @@ class ListenTextMessageHandler(TextMessageHandler):
                 if len(conn.asr_audio) > 0:
                     asr_audio_task = conn.asr_audio.copy()
                     conn.asr_audio.clear()
-                    conn.reset_vad_states()
+                    await conn.reset_vad_states()
 
                     if len(asr_audio_task) > 0:
                         await conn.asr.handle_voice_stop(conn, asr_audio_task)
@@ -64,12 +80,12 @@ class ListenTextMessageHandler(TextMessageHandler):
                     await send_tts_message(conn, "stop", None)
                     conn.client_is_speaking = False
                 elif is_wakeup_words:
-                    conn.just_woken_up = True
                     # 上报纯文字数据（复用ASR上报功能，但不提供音频数据）
-                    enqueue_asr_report(conn, "嘿，你好呀", [])
-                    await startToChat(conn, "嘿，你好呀")
+                    enqueue_asr_report(conn, original_text, [])
+                    await startToChat(conn, original_text)
                 else:
-                    conn.just_woken_up = True
+                    # 普通文本识别不播放本地唤醒提示音，不进入唤醒保护窗口，
+                    # 由正在播放状态和打断逻辑处理后续音频。
                     # 上报纯文字数据（复用ASR上报功能，但不提供音频数据）
                     enqueue_asr_report(conn, original_text, [])
                     # 否则需要LLM对文字内容进行答复

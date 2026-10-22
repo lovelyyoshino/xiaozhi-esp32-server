@@ -1,12 +1,23 @@
+"""百炼流式 ASR 的就绪握手、预录发送和资源回收。
+
+@author pony
+@date 2026-10-22
+@version v1.0.1
+@last_modified 2026-10-22
+@changelog
+    - v1.0.1 (2026-10-22): 清理未使用的类型导入
+    - v1.0.0 (2026-10-22): 就绪后顺序发送音频，限制握手等待并避免重复结束请求
+"""
+
 import json
 import uuid
 import asyncio
 import websockets
 import opuslib_next
-from typing import List
 from config.logger import setup_logging
 from core.providers.asr.base import ASRProviderBase
 from core.providers.asr.dto.dto import InterfaceType
+from core.providers.asr.audio_buffer import cache_voiceprint_audio, clear_voiceprint_audio
 
 TAG = __name__
 logger = setup_logging()
@@ -24,6 +35,10 @@ class ASRProvider(ASRProviderBase):
         self.is_processing = False
         self.server_ready = False  # 服务器准备状态
         self.task_id = None  # 当前任务ID
+        self._ready_event = asyncio.Event()
+        self._finish_sent = False
+        self.connect_timeout = float(config.get("connect_timeout", 5))
+        self.ready_timeout = float(config.get("ready_timeout", 5))
 
         # 阿里百炼配置
         self.api_key = config.get("api_key")
@@ -52,13 +67,7 @@ class ASRProvider(ASRProviderBase):
         await super().open_audio_channels(conn)
 
     async def receive_audio(self, conn, audio, audio_have_voice):
-        # 初始化音频缓存
-        if not hasattr(conn, 'asr_audio_for_voiceprint'):
-            conn.asr_audio_for_voiceprint = []
-
-        # 存储音频数据
-        if audio:
-            conn.asr_audio_for_voiceprint.append(audio)
+        cache_voiceprint_audio(conn, audio, audio_have_voice)
 
         conn.asr_audio.append(audio)
         conn.asr_audio = conn.asr_audio[-10:]
@@ -67,6 +76,10 @@ class ASRProvider(ASRProviderBase):
         if audio_have_voice and not self.is_processing and not self.asr_ws:
             try:
                 await self._start_recognition(conn)
+                # 预录与实时帧只由当前消费者发送；结果任务只通知 ready，避免交错或重复。
+                for cached_audio in conn.asr_audio[-10:]:
+                    await self.asr_ws.send(self.decoder.decode(cached_audio, 960))
+                return
             except Exception as e:
                 logger.bind(tag=TAG).error(f"开始识别失败: {str(e)}")
                 await self._cleanup()
@@ -91,6 +104,8 @@ class ASRProvider(ASRProviderBase):
 
             self.is_processing = True
             self.task_id = uuid.uuid4().hex
+            self._ready_event.clear()
+            self._finish_sent = False
 
             # 建立WebSocket连接
             headers = {
@@ -102,6 +117,9 @@ class ASRProvider(ASRProviderBase):
             self.asr_ws = await websockets.connect(
                 self.ws_url,
                 additional_headers=headers,
+                # PCM 上行带宽增加，但避免大量连接的逐包压缩争用 CPU；可显式恢复 deflate。
+                compression=self.config.get("websocket_compression"),
+                open_timeout=self.connect_timeout,
                 max_size=1000000000,
                 ping_interval=None,
                 ping_timeout=None,
@@ -117,6 +135,10 @@ class ASRProvider(ASRProviderBase):
             run_task_msg = self._build_run_task_message()
             await self.asr_ws.send(json.dumps(run_task_msg, ensure_ascii=False))
             logger.bind(tag=TAG).debug("已发送run-task指令，等待服务器准备...")
+            # 初始化期间保留音频在有界输入队列，防止滑动预录缓存覆盖首音节。
+            await asyncio.wait_for(self._ready_event.wait(), timeout=self.ready_timeout)
+            if not self.server_ready:
+                raise RuntimeError("百炼 ASR 在就绪前结束会话")
 
         except Exception as e:
             logger.bind(tag=TAG).error(f"建立ASR连接失败: {str(e)}")
@@ -177,17 +199,8 @@ class ASRProvider(ASRProviderBase):
                     # 处理task-started事件
                     if event == "task-started":
                         self.server_ready = True
-                        logger.bind(tag=TAG).debug("服务器已准备，开始发送缓存音频...")
-
-                        # 发送缓存音频
-                        if conn.asr_audio:
-                            for cached_audio in conn.asr_audio[-10:]:
-                                try:
-                                    pcm_frame = self.decoder.decode(cached_audio, 960)
-                                    await self.asr_ws.send(pcm_frame)
-                                except Exception as e:
-                                    logger.bind(tag=TAG).warning(f"发送缓存音频失败: {e}")
-                                    break
+                        self._ready_event.set()
+                        logger.bind(tag=TAG).debug("服务器已准备，通知音频消费者发送预录帧")
                         continue
 
                     # 处理result-generated事件
@@ -220,12 +233,12 @@ class ASRProvider(ASRProviderBase):
                                         await self.handle_voice_stop(conn, audio_data)
                                         # 清理音频缓存
                                         conn.asr_audio.clear()
-                                        conn.reset_vad_states()
+                                        await conn.reset_vad_states()
                                     break
                             else:
                                 # 自动模式下直接覆盖
                                 self.text = text
-                                conn.reset_vad_states()
+                                await conn.reset_vad_states()
                                 audio_data = getattr(conn, 'asr_audio_for_voiceprint', [])
                                 await self.handle_voice_stop(conn, audio_data)
                                 break
@@ -255,11 +268,13 @@ class ASRProvider(ASRProviderBase):
         except Exception as e:
             logger.bind(tag=TAG).error(f"结果转发失败: {str(e)}")
         finally:
+            # task-failed 或断连同样解除初始化等待，由发起者决定是否重试。
+            self._ready_event.set()
             # 清理连接的音频缓存
             await self._cleanup()
             if conn:
                 if hasattr(conn, 'asr_audio_for_voiceprint'):
-                    conn.asr_audio_for_voiceprint = []
+                    clear_voiceprint_audio(conn)
                 if hasattr(conn, 'asr_audio'):
                     conn.asr_audio = []
 
@@ -277,8 +292,9 @@ class ASRProvider(ASRProviderBase):
 
     async def _send_finish_task(self):
         """发送finish-task指令"""
-        if self.asr_ws and self.task_id:
+        if self.asr_ws and self.task_id and not self._finish_sent:
             try:
+                self._finish_sent = True
                 finish_msg = {
                     "header": {
                         "action": "finish-task",
@@ -292,11 +308,22 @@ class ASRProvider(ASRProviderBase):
                 await self.asr_ws.send(json.dumps(finish_msg, ensure_ascii=False))
                 logger.bind(tag=TAG).debug("已发送finish-task指令")
             except Exception as e:
+                self._finish_sent = False
                 logger.bind(tag=TAG).error(f"发送finish-task指令失败: {e}")
 
     async def _cleanup(self):
         """清理资源"""
         logger.bind(tag=TAG).debug(f"开始ASR会话清理 | 当前状态: processing={self.is_processing}, server_ready={self.server_ready}")
+
+        # 外部失败或断连时结束接收任务；从接收任务自身进入 finally 时只清理资源。
+        task = self.forward_task
+        self.forward_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
         # 状态重置
         self.is_processing = False
@@ -308,8 +335,6 @@ class ASRProvider(ASRProviderBase):
             try:
                 # 先发送finish-task指令
                 await self._send_finish_task()
-                # 等待一小段时间让服务器处理
-                await asyncio.sleep(0.1)
 
                 logger.bind(tag=TAG).debug("正在关闭WebSocket连接")
                 await asyncio.wait_for(self.asr_ws.close(), timeout=2.0)

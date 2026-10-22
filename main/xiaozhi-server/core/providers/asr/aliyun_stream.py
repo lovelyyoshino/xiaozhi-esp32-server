@@ -1,3 +1,13 @@
+"""阿里云流式 ASR 与连接专属音频缓存管理。
+
+@author pony
+@date 2026-10-22
+@version v1.0.0
+@last_modified 2026-10-22
+@changelog
+    - v1.0.0 (2026-10-22): 限制空闲声纹缓存并适配异步 VAD 重置与关闭资源
+"""
+
 import json
 import time
 import uuid
@@ -13,6 +23,7 @@ from datetime import datetime
 from config.logger import setup_logging
 from core.providers.asr.base import ASRProviderBase
 from core.providers.asr.dto.dto import InterfaceType
+from core.providers.asr.audio_buffer import cache_voiceprint_audio, clear_voiceprint_audio
 
 TAG = __name__
 logger = setup_logging()
@@ -126,13 +137,7 @@ class ASRProvider(ASRProviderBase):
         await super().open_audio_channels(conn)
 
     async def receive_audio(self, conn, audio, audio_have_voice):
-        # 初始化音频缓存
-        if not hasattr(conn, 'asr_audio_for_voiceprint'):
-            conn.asr_audio_for_voiceprint = []
-        
-        # 存储音频数据
-        if audio:
-            conn.asr_audio_for_voiceprint.append(audio)
+        cache_voiceprint_audio(conn, audio, audio_have_voice)
         
         conn.asr_audio.append(audio)
         conn.asr_audio = conn.asr_audio[-10:]
@@ -263,12 +268,12 @@ class ASRProvider(ASRProviderBase):
                                         await self.handle_voice_stop(conn, audio_data)
                                         # 清理音频缓存
                                         conn.asr_audio.clear()
-                                        conn.reset_vad_states()
+                                        await conn.reset_vad_states()
                                     break
                             else:
                                 # 自动模式下直接覆盖
                                 self.text = text
-                                conn.reset_vad_states()
+                                await conn.reset_vad_states()
                                 audio_data = getattr(conn, 'asr_audio_for_voiceprint', [])
                                 await self.handle_voice_stop(conn, audio_data)
                                 break
@@ -291,7 +296,7 @@ class ASRProvider(ASRProviderBase):
             await self._cleanup()
             if conn:
                 if hasattr(conn, 'asr_audio_for_voiceprint'):
-                    conn.asr_audio_for_voiceprint = []
+                    clear_voiceprint_audio(conn)
                 if hasattr(conn, 'asr_audio'):
                     conn.asr_audio = []
 
@@ -349,7 +354,7 @@ class ASRProvider(ASRProviderBase):
 
     async def close(self):
         """关闭资源"""
-        await self._cleanup(None)
+        await self._cleanup()
         if hasattr(self, 'decoder') and self.decoder is not None:
             try:
                 del self.decoder

@@ -1,6 +1,17 @@
+"""处理已完成有序 VAD 检测的设备音频及对话触发。
+
+@author pony
+@date 2026-10-22
+@version v1.2.0
+@last_modified 2026-10-22
+@changelog
+    - v1.2.0 (2026-10-22): 取消固定两秒唤醒屏蔽，由提示音发送生命周期管理保护
+    - v1.1.0 (2026-10-22): 通过有界共享池提交回复，拥塞时补发结束状态
+    - v1.0.0 (2026-10-22): 复用音频消费者的 VAD 结果，避免主事件循环执行推理
+"""
+
 import time
 import json
-import asyncio
 from core.utils.util import audio_to_data
 from core.handle.abortHandle import handleAbortMessage
 from core.handle.intentHandler import handle_user_intent
@@ -10,16 +21,11 @@ from core.handle.sendAudioHandle import send_stt_message, SentenceType
 TAG = __name__
 
 
-async def handleAudioMessage(conn, audio):
-    # 当前片段是否有人说话
-    have_voice = conn.vad.is_vad(conn, audio)
-    # 如果设备刚刚被唤醒，短暂忽略VAD检测
+async def handleAudioMessage(conn, audio, have_voice):
+    # VAD结果由该连接的有序ASR消费任务提前计算。
+    # 本地唤醒提示音播放期间忽略回采音频；标志位在提示音发送完成后立即清除。
     if hasattr(conn, "just_woken_up") and conn.just_woken_up:
-        have_voice = False
-        # 设置一个短暂延迟后恢复VAD检测
         conn.asr_audio.clear()
-        if not hasattr(conn, "vad_resume_task") or conn.vad_resume_task.done():
-            conn.vad_resume_task = asyncio.create_task(resume_vad_detection(conn))
         return
     # manual 模式下不打断正在播放的内容
     if have_voice:
@@ -29,12 +35,6 @@ async def handleAudioMessage(conn, audio):
     await no_voice_close_connect(conn, have_voice)
     # 接收音频
     await conn.asr.receive_audio(conn, audio, have_voice)
-
-
-async def resume_vad_detection(conn):
-    # 等待2秒后恢复VAD检测
-    await asyncio.sleep(2)
-    conn.just_woken_up = False
 
 
 async def startToChat(conn, text):
@@ -94,7 +94,7 @@ async def startToChat(conn, text):
 
     # 意图未被处理，继续常规聊天流程，使用实际文本内容
     await send_stt_message(conn, actual_text)
-    conn.executor.submit(conn.chat, actual_text)
+    await conn.submit_reply(conn.chat, actual_text)
 
 
 async def no_voice_close_connect(conn, have_voice):
@@ -166,7 +166,7 @@ async def check_bind_device(conn):
     else:
         # 播放未绑定提示
         conn.client_abort = False
-        text = f"没有找到该设备的版本信息，请正确配置 OTA地址，然后重新编译固件。"
+        text = "没有找到该设备的版本信息，请正确配置 OTA地址，然后重新编译固件。"
         await send_stt_message(conn, text)
         music_path = "config/assets/bind_not_found.wav"
         opus_packets = await audio_to_data(music_path)
