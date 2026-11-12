@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-10-22
-@version v1.4.0
-@last_modified 2026-10-22
+@version v1.5.0
+@last_modified 2026-11-12
 @changelog
+    - v1.5.0 (2026-11-12): 透传本地唤醒词门控配置与新连接初始化排队时长
     - v1.4.0 (2026-10-22): 透传本地短唤醒确认音模式
     - v1.3.0 (2026-10-22): 透传回复短时等待与本地繁忙提示配置
     - v1.2.0 (2026-10-22): 透传云 TTS 返回音频的本地 Opus 编码复杂度
@@ -104,6 +105,8 @@ async def get_config_from_api_async(config):
             "reply_busy_audio",
             "reply_busy_text",
             "tts_opus_complexity",
+            "wake_word_gate",
+            "init_admission_wait_ms",
         ):
             if key in config["server"]:
                 config_data["server"][key] = config["server"][key]

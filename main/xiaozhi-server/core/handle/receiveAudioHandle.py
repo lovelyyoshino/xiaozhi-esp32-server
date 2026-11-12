@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-10-22
-@version v1.2.0
-@last_modified 2026-10-22
+@version v1.3.0
+@last_modified 2026-11-12
 @changelog
+    - v1.3.0 (2026-11-12): 语音识别结果先过唤醒词门控，未带唤醒词的句子标记已忽略且不打断播报
     - v1.2.0 (2026-10-22): 取消固定两秒唤醒屏蔽，由提示音发送生命周期管理保护
     - v1.1.0 (2026-10-22): 通过有界共享池提交回复，拥塞时补发结束状态
     - v1.0.0 (2026-10-22): 复用音频消费者的 VAD 结果，避免主事件循环执行推理
@@ -16,7 +17,12 @@ from core.utils.util import audio_to_data
 from core.handle.abortHandle import handleAbortMessage
 from core.handle.intentHandler import handle_user_intent
 from core.utils.output_counter import check_device_output_limit
-from core.handle.sendAudioHandle import send_stt_message, SentenceType
+from core.utils.wake_word_gate import get_wake_word_gate
+from core.handle.sendAudioHandle import (
+    send_stt_message,
+    send_ignored_stt_message,
+    SentenceType,
+)
 
 TAG = __name__
 
@@ -37,7 +43,47 @@ async def handleAudioMessage(conn, audio, have_voice):
     await conn.asr.receive_audio(conn, audio, have_voice)
 
 
-async def startToChat(conn, text):
+async def apply_wake_word_gate(conn, text):
+    """语音识别结果的唤醒词门控。返回交给对话的文本；返回 None 表示忽略这一句。"""
+    gate = get_wake_word_gate(conn)
+    if gate is None:
+        return text
+
+    # 带说话人信息的 JSON 只检查 content，放行后保持原有 JSON 结构
+    data = None
+    content = text
+    if text.strip().startswith("{") and text.strip().endswith("}"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
+                data, content = parsed, parsed["content"]
+        except json.JSONDecodeError:
+            pass
+
+    decision = gate.evaluate(content, manual=conn.client_listen_mode == "manual")
+    if not decision.passed:
+        conn.logger.bind(tag=TAG).info(f"未带唤醒词，已忽略: {content}")
+        await send_ignored_stt_message(conn, content)
+        return None
+    if decision.text != content:
+        conn.logger.bind(tag=TAG).info(
+            f"唤醒词门控放行({decision.reason}): {content} -> {decision.text}"
+        )
+    else:
+        conn.logger.bind(tag=TAG).info(f"唤醒词门控放行({decision.reason}): {content}")
+    if data is None:
+        return decision.text
+    data["content"] = decision.text
+    return json.dumps(data, ensure_ascii=False)
+
+
+async def startToChat(conn, text, from_asr=False):
+    # 只检查语音识别结果；文字输入、唤醒问候和结束语不经过唤醒词门控
+    if from_asr:
+        text = await apply_wake_word_gate(conn, text)
+        if text is None:
+            return
+
     # 检查输入是否是JSON格式（包含说话人信息）
     speaker_name = None
     language_tag = None

@@ -22,6 +22,8 @@ server:
   connection_max_pending: 16
   # 回复提交遇到短突发时最多等待（毫秒），避免瞬时满载直接表现为无响应
   reply_admission_wait_ms: 200
+  # 新连接初始化名额满时最多排队等待（毫秒），超时才关闭连接；批量重连时避免直接踢掉设备
+  init_admission_wait_ms: 15000
   # 繁忙时播放本地提示音，可替换为预录的繁忙语音；空字符串只显示文字
   reply_busy_audio: config/assets/tts_notify.mp3
   reply_busy_text: "现在请求较多，请稍后再试。"
@@ -29,6 +31,22 @@ server:
   websocket_compression: null
   # 云 TTS 返回 PCM 时的本地 Opus 编码复杂度（0–10）；4 核先用 5，音质需听测
   tts_opus_complexity: 5
+  # 唤醒词门控：语音识别出的句子须在句首或句尾带唤醒词才回应，避免把旁人对话当成指令
+  # 未带唤醒词的句子仍以 stt 消息发给客户端（带 ignored: true），不进入大模型
+  wake_word_gate:
+    enabled: false
+    # 按拼音模糊匹配，同音误写（小算、小酸、晓蒜）自动命中；小帅、诺瓦是实测的识别误写
+    words: ["小蒜", "小帅", "Nova", "诺瓦"]
+    # 紧挨在唤醒词前的问候算作唤醒词的一部分，覆盖“你好小蒜”“hi Nova”
+    greetings: ["你好", "嗨", "hi", "hey", "hello"]
+    # 唤醒词前最多允许的字数（如“嘿小蒜”“好的小蒜”），超过视为句中提及
+    head_max_offset: 2
+    # 句尾唤醒词后允许跟的语气词
+    tail_particles: "啊呀吧呢哈嘛哦啦呗"
+    # 设备唤醒或机器人以问句结束时，放行用户下一句的有效期（秒，从机器人说完开始算）
+    follow_up_seconds: 10
+    # 整句只有这些短指令时免检（可带语气词）
+    safety_commands: ["停", "停下", "停止", "站住", "别走", "等一下"]
   # http服务的端口，用于简单OTA接口(单服务部署)，以及视觉分析接口
   http_port: 8003
   # 这个websocket配置是指ota接口向设备发送的websocket地址

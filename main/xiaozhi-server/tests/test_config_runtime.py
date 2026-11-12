@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-10-22
-@version v1.3.0
-@last_modified 2026-10-22
+@version v1.4.0
+@last_modified 2026-11-12
 @changelog
+    - v1.4.0 (2026-11-12): 验证唤醒词门控与初始化排队时长配置透传
     - v1.3.0 (2026-10-22): 验证唤醒模式和拥塞反馈参数透传
     - v1.2.0 (2026-10-22): 覆盖本地 Opus 编码复杂度透传及缺省兼容
     - v1.1.0 (2026-10-22): 覆盖共享后台任务上限的智控台配置透传
@@ -60,6 +61,8 @@ def test_api_config_preserves_local_runtime_budget_and_remote_auth(monkeypatch):
             "connection_max_pending": 36,
             "websocket_compression": None,
             "tts_opus_complexity": 5,
+            "wake_word_gate": {"enabled": True, "words": ["小蒜"]},
+            "init_admission_wait_ms": 15000,
         },
         "manager-api": {"url": "http://manager", "secret": "local-secret"},
         "prompt_template": "local-prompt",
@@ -83,6 +86,8 @@ def test_api_config_preserves_local_runtime_budget_and_remote_auth(monkeypatch):
         "connection_max_pending": 36,
         "websocket_compression": None,
         "tts_opus_complexity": 5,
+        "wake_word_gate": {"enabled": True, "words": ["小蒜"]},
+        "init_admission_wait_ms": 15000,
         "auth": {"enabled": True},
     }
     assert "api_only_value" not in result["server"]
@@ -112,4 +117,6 @@ def test_api_config_omits_optional_runtime_keys_when_local_does_not_define_them(
     assert "connection_max_pending" not in result["server"]
     assert "websocket_compression" not in result["server"]
     assert "tts_opus_complexity" not in result["server"]
+    assert "wake_word_gate" not in result["server"]
+    assert "init_admission_wait_ms" not in result["server"]
     assert result["server"]["auth"] == {"enabled": False}

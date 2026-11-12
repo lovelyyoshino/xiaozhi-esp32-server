@@ -5,6 +5,7 @@ from core.utils import textUtils
 from core.utils.util import audio_to_data
 from core.providers.tts.dto.dto import SentenceType
 from core.utils.audioRateController import AudioRateController
+from core.utils.wake_word_gate import get_wake_word_gate
 
 TAG = __name__
 # 音频帧时长（毫秒）
@@ -279,6 +280,31 @@ async def send_tts_message(conn, state, text=None):
 
     # 发送消息到客户端
     await conn.websocket.send(json.dumps(message))
+
+    # 唤醒词门控据此判断机器人是否在说话，以及说完时最后一句是否为提问
+    gate = get_wake_word_gate(conn)
+    if gate is not None:
+        if state == "start":
+            gate.on_speech_start()
+        elif state == "sentence_start":
+            gate.on_sentence(text)
+        elif state == "stop":
+            gate.on_speech_end()
+
+
+async def send_ignored_stt_message(conn, text):
+    """发送被唤醒词门控忽略的识别文本：带 ignored 标记，不发 tts start，客户端照常收音。"""
+    stt_text = textUtils.get_string_no_punctuation_or_emoji(text)
+    await conn.websocket.send(
+        json.dumps(
+            {
+                "type": "stt",
+                "text": stt_text,
+                "session_id": conn.session_id,
+                "ignored": True,
+            }
+        )
+    )
 
 
 async def send_stt_message(conn, text):

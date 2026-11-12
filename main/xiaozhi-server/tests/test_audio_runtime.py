@@ -2,9 +2,11 @@
 
 @author pony
 @date 2026-10-22
-@version v1.6.0
-@last_modified 2026-10-22
+@version v1.7.0
+@last_modified 2026-11-12
 @changelog
+    - v1.7.0 (2026-11-12): 覆盖豆包旧连接关闭期间下一句立即开新会话，旧任务收尾不影响新会话
+    - v1.6.1 (2026-11-12): 识别结果以语音来源进入对话
     - v1.6.0 (2026-10-22): 覆盖短唤醒确认、异常恢复及音频满队列断连清理
     - v1.5.0 (2026-10-22): 覆盖本地繁忙提示的音频发送依赖与协议顺序
     - v1.4.0 (2026-10-22): 验证共享后台预算、断连任务归属和拥塞结束回复
@@ -430,7 +432,7 @@ def test_doubao_final_result_uses_current_audio_even_for_short_commands(
         captured = provider.handle_voice_stop.call_args.args[1]
         assert captured == frames
         assert captured is not frames
-        asr_base.startToChat.assert_awaited_once_with(conn, "停下")
+        asr_base.startToChat.assert_awaited_once_with(conn, "停下", from_asr=True)
         assert not conn.asr_audio_for_voiceprint
         assert not conn._asr_voiceprint_capture_active
         assert not provider.is_processing
@@ -454,6 +456,113 @@ def test_doubao_stop_is_sent_once_and_rejects_late_audio(runtime_loader, asr_bas
         assert ws.send.await_count == 1
         assert gzip.decompress(ws.send.call_args.args[0][8:]) == b""
         await provider.close()
+
+    asyncio.run(scenario())
+
+
+def _doubao_with_next_session(runtime_loader, asr_base):
+    """旧会话关闭握手可能拖到 close_timeout；下一句必须能用新连接立即开始。"""
+    new_ws = SimpleNamespace(send=AsyncMock(), close=AsyncMock())
+    new_ready = [b"ready"]
+
+    async def new_recv():
+        if new_ready:
+            return new_ready.pop()
+        await asyncio.Event().wait()
+
+    new_ws.recv = new_recv
+    connect = AsyncMock(return_value=new_ws)
+    module = runtime_loader(
+        "core/providers/asr/doubao_stream.py",
+        **{
+            "core.providers.asr.base": {"ASRProviderBase": asr_base.ASRProviderBase},
+            "websockets": {"connect": connect, "ConnectionClosed": ConnectionError},
+        },
+    )
+    provider = module.ASRProvider({}, False)
+    provider.decoder = SimpleNamespace(decode=lambda audio, _: audio)
+    final = {"payload_msg": {"result": {
+        "text": "停下", "utterances": [{"text": "停下", "definite": True}]
+    }}}
+    provider.parse_response = lambda res: {"code": 1000} if res == b"ready" else final
+    return provider, new_ws, connect
+
+
+def test_doubao_next_utterance_starts_while_previous_connection_is_closing(
+    runtime_loader, asr_base
+):
+    async def scenario():
+        provider, new_ws, connect = _doubao_with_next_session(runtime_loader, asr_base)
+        release_close = asyncio.Event()
+
+        async def slow_close():
+            await release_close.wait()
+
+        old_results = [b"final"]
+
+        async def old_recv():
+            if old_results:
+                return old_results.pop()
+            await asyncio.Event().wait()
+
+        old_ws = SimpleNamespace(recv=old_recv, close=AsyncMock(side_effect=slow_close))
+        provider.asr_ws = old_ws
+        provider.is_processing = True
+        conn = make_connection(
+            asr_audio_for_voiceprint=[b"command"], reset_vad_states=AsyncMock()
+        )
+        old_task = asyncio.create_task(provider._forward_asr_results(conn))
+        try:
+            for _ in range(100):
+                if asr_base.startToChat.await_count:
+                    break
+                await asyncio.sleep(0)
+            # 结果已交付：旧连接仍在关闭，但引用已释放
+            assert provider.asr_ws is None
+            await provider.receive_audio(conn, b"next", True)
+            connect.assert_awaited_once()
+            assert provider.asr_ws is new_ws and provider.is_processing
+
+            release_close.set()
+            await asyncio.wait_for(old_task, 2)
+            # 旧任务收尾不能关掉或清空新连接
+            assert provider.asr_ws is new_ws and provider.is_processing
+            new_ws.close.assert_not_awaited()
+        finally:
+            release_close.set()
+            await provider.close()
+
+    asyncio.run(scenario())
+
+
+def test_doubao_stale_receiver_does_not_reset_new_session(runtime_loader, asr_base):
+    async def scenario():
+        provider, new_ws, _ = _doubao_with_next_session(runtime_loader, asr_base)
+        old_closed = asyncio.Event()
+
+        async def old_recv():
+            await old_closed.wait()
+            raise ConnectionError("旧连接关闭完成")
+
+        provider.asr_ws = SimpleNamespace(recv=old_recv, close=AsyncMock())
+        provider.is_processing = True
+        conn = make_connection(asr_audio=[b"pre"], reset_vad_states=AsyncMock())
+        old_task = asyncio.create_task(provider._forward_asr_results(conn))
+        try:
+            await asyncio.sleep(0)
+            # 如声纹路径：结果已在别处交付，旧接收任务还阻塞在 recv
+            provider.stop_ws_connection()
+            await provider.receive_audio(conn, b"next", True)
+            assert provider.asr_ws is new_ws
+
+            old_closed.set()
+            await asyncio.wait_for(old_task, 2)
+            assert provider.asr_ws is new_ws and provider.is_processing
+            # 新一轮的预录缓存不能被旧任务清掉
+            assert conn.asr_audio == [b"pre", b"next"]
+        finally:
+            old_closed.set()
+            await provider.close()
 
     asyncio.run(scenario())
 

@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-10-22
-@version v1.1.0
-@last_modified 2026-10-22
+@version v1.2.0
+@last_modified 2026-11-12
 @changelog
+    - v1.2.0 (2026-11-12): 设备本地唤醒后为唤醒词门控放行下一句
     - v1.1.0 (2026-10-22): 使用实际唤醒词命中缓存，普通识别不再开启唤醒屏蔽
     - v1.0.0 (2026-10-22): stop 等待有界音频队列，异步重置 VAD 状态
 """
@@ -19,6 +20,7 @@ from core.handle.sendAudioHandle import send_stt_message, send_tts_message
 from core.handle.textMessageHandler import TextMessageHandler
 from core.handle.textMessageType import TextMessageType
 from core.utils.util import remove_punctuation_and_length
+from core.utils.wake_word_gate import get_wake_word_gate
 from core.providers.asr.dto.dto import InterfaceType
 
 TAG = __name__
@@ -65,6 +67,10 @@ class ListenTextMessageHandler(TextMessageHandler):
             if "text" in msg_json:
                 conn.last_activity_time = time.time() * 1000
                 original_text = msg_json["text"]  # 保留原始文本
+                # 设备本地唤醒（如“你好小蒜”）后，用户的下一句不要求再带唤醒词
+                gate = get_wake_word_gate(conn)
+                if gate is not None and gate.matcher.is_wake_only(original_text):
+                    gate.grant_follow_up("wake")
                 filtered_len, filtered_text = remove_punctuation_and_length(
                     original_text
                 )

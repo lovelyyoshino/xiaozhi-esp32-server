@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-10-22
-@version v1.1.0
-@last_modified 2026-10-22
+@version v1.2.0
+@last_modified 2026-11-12
 @changelog
+    - v1.2.0 (2026-11-12): 识别结果标记为语音来源，交由唤醒词门控检查
     - v1.1.0 (2026-10-22): 唤醒保护期间跳过回采包，避免无效 VAD 推理
     - v1.0.0 (2026-10-22): 使用异步消费任务与队列背压，跳过未启用声纹时的重复解码
 """
@@ -179,7 +180,7 @@ class ASRProviderBase(ABC):
 
             if text_len > 0:
                 # 使用自定义模块进行上报
-                await startToChat(conn, enhanced_text)
+                await startToChat(conn, enhanced_text, from_asr=True)
                 enqueue_asr_report(conn, enhanced_text, asr_audio_task)
                 
         except Exception as e:

@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-10-22
-@version v1.1.1
-@last_modified 2026-10-22
+@version v1.2.0
+@last_modified 2026-11-12
 @changelog
+    - v1.2.0 (2026-11-12): 结果交付后立即释放连接引用，修复上一句后约 10 秒内语音被丢弃；旧接收任务按会话序号收尾
     - v1.1.1 (2026-10-22): 清理无格式变量的日志字符串
     - v1.1.0 (2026-10-22): 修复短指令收尾、音频快照竞争和重复停止请求
     - v1.0.0 (2026-10-22): 快速 gzip、握手超时、预录去重与有界空闲音频缓存
@@ -36,6 +37,8 @@ class ASRProvider(ASRProviderBase):
         self.forward_task = None
         self.is_processing = False  # 添加处理状态标志
         self._stop_sent = False
+        # 会话序号：旧接收任务据此判断是否已有新会话，避免收尾时复位新会话的状态
+        self._session_seq = 0
         self.connect_timeout = float(config.get("connect_timeout", 5))
         self.ready_timeout = float(config.get("ready_timeout", 5))
         # 60ms 小包采用快速 gzip；协议仍为 gzip，可按带宽预算调整为 1–9。
@@ -100,6 +103,7 @@ class ASRProvider(ASRProviderBase):
             try:
                 self.is_processing = True
                 self._stop_sent = False
+                self._session_seq += 1
                 started_this_packet = True
                 # 建立新的WebSocket连接
                 headers = self.token_auth() if self.auth_method == "token" else None
@@ -194,10 +198,13 @@ class ASRProvider(ASRProviderBase):
                 logger.bind(tag=TAG).info(f"发送音频数据时发生错误: {e}")
 
     async def _forward_asr_results(self, conn):
+        # 只操作本会话的连接：结果交付后 self.asr_ws 会被立即释放，新会话可能已经开始。
+        ws = self.asr_ws
+        session = self._session_seq
         try:
-            while self.asr_ws and not conn.stop_event.is_set():
+            while ws is not None and self.asr_ws is ws and not conn.stop_event.is_set():
                 try:
-                    response = await self.asr_ws.recv()
+                    response = await ws.recv()
                     # recv 期间音频消费者仍可能追加数据，必须在结果到达后复制快照。
                     audio_data = list(getattr(conn, "asr_audio_for_voiceprint", []))
                     result = self.parse_response(response)
@@ -282,13 +289,15 @@ class ASRProvider(ASRProviderBase):
 
                 except websockets.ConnectionClosed:
                     logger.bind(tag=TAG).info("ASR服务连接已关闭")
-                    self.is_processing = False
+                    if self._session_seq == session:
+                        self.is_processing = False
                     break
                 except Exception as e:
                     logger.bind(tag=TAG).error(f"处理ASR结果时发生错误: {str(e)}")
                     if hasattr(e, "__cause__") and e.__cause__:
                         logger.bind(tag=TAG).error(f"错误原因: {str(e.__cause__)}")
-                    self.is_processing = False
+                    if self._session_seq == session:
+                        self.is_processing = False
                     break
 
         except Exception as e:
@@ -296,20 +305,26 @@ class ASRProvider(ASRProviderBase):
             if hasattr(e, "__cause__") and e.__cause__:
                 logger.bind(tag=TAG).error(f"错误原因: {str(e.__cause__)}")
         finally:
-            if self.asr_ws:
-                await self.asr_ws.close()
+            # 先在任何 await 之前同步收尾；已有新会话时不复位其状态、不清其缓存。
+            if self.asr_ws is ws:
                 self.asr_ws = None
-            self.is_processing = False
-            if conn:
-                if hasattr(conn, 'asr_audio_for_voiceprint'):
-                    clear_voiceprint_audio(conn)
-                if hasattr(conn, 'asr_audio'):
-                    conn.asr_audio = []
+            if self._session_seq == session:
+                self.is_processing = False
+                if conn:
+                    if hasattr(conn, 'asr_audio_for_voiceprint'):
+                        clear_voiceprint_audio(conn)
+                    if hasattr(conn, 'asr_audio'):
+                        conn.asr_audio = []
+            if ws is not None:
+                await ws.close()
 
     def stop_ws_connection(self):
-        if self.asr_ws:
-            asyncio.create_task(self.asr_ws.close())
-            # 接收任务清理前保留引用，避免旧任务收尾时误关新一轮的连接。
+        ws = self.asr_ws
+        if ws:
+            # 结果已交付：立即释放引用，下一句可马上建立新会话；关闭握手（最长
+            # close_timeout）在后台完成。旧接收任务只操作自己的连接，不会误关新连接。
+            self.asr_ws = None
+            asyncio.create_task(ws.close())
         self.is_processing = False
 
     async def _send_stop_request(self):
