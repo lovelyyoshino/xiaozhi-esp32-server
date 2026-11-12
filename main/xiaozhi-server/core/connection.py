@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-10-22
-@version v1.3.0
-@last_modified 2026-10-22
+@version v1.4.0
+@last_modified 2026-11-12
 @changelog
+    - v1.4.0 (2026-11-12): 新连接初始化名额满时排队等待（默认 15 秒），批量重连不再直接断开设备
     - v1.3.0 (2026-10-22): 保留满队列音频顺序，断连取消等待写入并记录背压次数
     - v1.2.0 (2026-10-22): 唤醒期间过滤回采，回复短时重试并提供本地繁忙反馈
     - v1.1.0 (2026-10-22): 共用有界后台任务预算，拥塞结束回复，断连取消自身任务
@@ -621,9 +622,16 @@ class ConnectionHandler:
         try:
             # 异步获取差异化配置
             await self._initialize_private_config_async()
-            # 在线程池中初始化组件
-            if self.submit_background(self._initialize_components) is None:
-                # 初始化也受进程预算约束，失败时关闭连接，避免设备一直等待就绪。
+            # 在线程池中初始化组件；名额满时排队等待（批量重连时不再直接踢掉设备），超时才关闭
+            loop = asyncio.get_running_loop()
+            wait_ms = int(self.config.get("server", {}).get("init_admission_wait_ms", 15000))
+            deadline = loop.time() + max(0, wait_ms) / 1000
+            future = self.submit_background(self._initialize_components)
+            while future is None and not self.stop_event.is_set() and loop.time() < deadline:
+                await asyncio.sleep(0.05)
+                future = self.submit_background(self._initialize_components)
+            if future is None and not self.stop_event.is_set():
+                self.logger.bind(tag=TAG).warning("初始化排队超时，关闭连接")
                 await self.close(self.websocket)
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"后台初始化失败: {e}")

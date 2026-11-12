@@ -3,7 +3,6 @@ import requests
 import json
 from config.logger import setup_logging
 from plugins_func.register import register_function, ToolType, ActionResponse, Action
-from markitdown import MarkItDown
 
 TAG = __name__
 logger = setup_logging()
@@ -150,6 +149,8 @@ def fetch_news_detail(url):
         response.raise_for_status()
 
         # 使用MarkItDown清理HTML内容
+        from markitdown import MarkItDown  # 懒加载：该依赖约 87 MB，只有查新闻详情时才需要
+
         md = MarkItDown(enable_plugins=False)
         result = md.convert(response)
 

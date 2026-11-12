@@ -1,0 +1,31 @@
+# 小智服务端 CPU 精简依赖（适用于：豆包流式 ASR + 火山双流式 TTS + OpenAI 兼容 LLM + intent_llm/function_call + nomem + silero_onnx VAD + 唤醒词门控）
+# 由导入采集得出：服务端入口 + 上述 provider + plugins_func 全部插件实际加载的第三方包。
+# 不包含：torch / torchaudio / funasr / modelscope / sherpa_onnx / vosk / mem0ai / google-generativeai / dashscope / baidu-aip / edge_tts /
+#         cozepy / markitdown（仅查新闻详情时懒加载，需要该插件时再装）/ ormsgpack / ruamel.yaml / aiohttp_cors / silero_vad
+# 切换到本地 ASR（FunASR/sherpa）、mem0 记忆、Gemini/Coze/通义百炼等 provider 时需另装对应包。
+# 系统依赖：ffmpeg（pydub 处理提示音资源时调用）
+aioconsole==0.8.2
+aiohttp==3.13.2
+beautifulsoup4==4.14.3
+chardet==5.2.0
+cnlunar==0.2.0
+cryptography==44.0.1
+httpx==0.28.1
+Jinja2==3.1.6
+loguru==0.7.3
+mcp==1.22.0
+numpy==1.26.4
+onnxruntime==1.23.2
+openai==2.8.1
+opuslib_next==1.1.5
+portalocker==3.2.0
+psutil==7.1.3
+pydub==0.25.1
+pypinyin==0.53.0
+PyJWT==2.10.1
+PySocks==1.7.1
+python-dotenv==1.2.1
+PyYAML==6.0.3
+requests==2.32.5
+simplejson==3.20.1
+websockets==14.2

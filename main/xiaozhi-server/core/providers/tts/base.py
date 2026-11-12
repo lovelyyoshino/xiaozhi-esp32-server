@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-10-22
-@version v1.0.0
-@last_modified 2026-10-22
+@version v1.1.0
+@last_modified 2026-11-12
 @changelog
+    - v1.1.0 (2026-11-12): 空闲连接的播放队列轮询从 0.1 秒放宽到 1 秒，减少空唤醒和 GIL 争用
     - v1.0.0 (2026-10-22): 开通音频通道时应用本地 Opus 编码复杂度预算
 """
 
@@ -343,7 +344,7 @@ class TTSProviderBase(ABC):
             try:
                 try:
                     sentence_type, audio_datas, text = self.tts_audio_queue.get(
-                        timeout=0.1
+                        timeout=1.0  # 空闲连接每秒只醒 1 次（原 0.1s：每连接每秒 10 次空唤醒，抢 GIL）
                     )
                 except queue.Empty:
                     if self.conn.stop_event.is_set():
