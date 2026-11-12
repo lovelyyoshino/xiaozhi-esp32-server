@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any, List, Dict
 from ..base import IntentProviderBase
 from plugins_func.functions.play_music import initialize_music_handler
@@ -268,8 +269,12 @@ class IntentProvider(IntentProviderBase):
         llm_start_time = time.time()
         logger.bind(tag=TAG).debug(f"开始LLM意图识别调用, 模型: {model_info}")
 
-        intent = self.llm.response_no_stream(
-            system_prompt=prompt_music, user_prompt=user_prompt
+        # 同步大模型客户端放到线程池执行：大模型响应慢时不能阻塞事件循环，
+        # 否则所有连接的音频处理、心跳和新连接握手都会一起停住。
+        intent = await asyncio.to_thread(
+            self.llm.response_no_stream,
+            system_prompt=prompt_music,
+            user_prompt=user_prompt,
         )
 
         # 记录LLM调用完成时间
