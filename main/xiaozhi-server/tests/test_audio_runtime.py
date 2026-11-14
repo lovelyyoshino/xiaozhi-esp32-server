@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-10-22
-@version v1.7.0
-@last_modified 2026-11-12
+@version v1.7.1
+@last_modified 2026-11-14
 @changelog
+    - v1.7.1 (2026-11-14): 覆盖豆包热词表、替换词表放在 request.corpus 下，未配置时不发送
     - v1.7.0 (2026-11-12): 覆盖豆包旧连接关闭期间下一句立即开新会话，旧任务收尾不影响新会话
     - v1.6.1 (2026-11-12): 识别结果以语音来源进入对话
     - v1.6.0 (2026-10-22): 覆盖短唤醒确认、异常恢复及音频满队列断连清理
@@ -438,6 +439,30 @@ def test_doubao_final_result_uses_current_audio_even_for_short_commands(
         assert not provider.is_processing
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "config, corpus",
+    [
+        ({}, None),
+        ({"boosting_table_name": "", "correct_table_name": ""}, None),
+        ({"boosting_table_name": "Guide_dog"}, {"boosting_table_name": "Guide_dog"}),
+        (
+            {"boosting_table_name": "Guide_dog", "correct_table_name": "fix"},
+            {"boosting_table_name": "Guide_dog", "correct_table_name": "fix"},
+        ),
+    ],
+)
+def test_doubao_hotword_tables_are_sent_under_corpus(runtime_loader, asr_base, config, corpus):
+    module = runtime_loader(
+        "core/providers/asr/doubao_stream.py",
+        **{"core.providers.asr.base": {"ASRProviderBase": asr_base.ASRProviderBase}},
+    )
+    request = module.ASRProvider(config, False).construct_request("rid")["request"]
+    # 豆包只认 request.corpus 下的词表；放在顶层会被静默忽略
+    assert request.get("corpus") == corpus
+    assert "boosting_table_name" not in request
+    assert "correct_table_name" not in request
 
 
 def test_doubao_stop_is_sent_once_and_rejects_late_audio(runtime_loader, asr_base):

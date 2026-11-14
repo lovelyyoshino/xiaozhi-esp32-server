@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-10-22
-@version v1.2.0
-@last_modified 2026-11-12
+@version v1.2.1
+@last_modified 2026-11-14
 @changelog
+    - v1.2.1 (2026-11-14): 热词表、替换词表改放 request.corpus，原顶层写法豆包不生效
     - v1.2.0 (2026-11-12): 结果交付后立即释放连接引用，修复上一句后约 10 秒内语音被丢弃；旧接收任务按会话序号收尾
     - v1.1.1 (2026-10-22): 清理无格式变量的日志字符串
     - v1.1.0 (2026-10-22): 修复短指令收尾、音频快照竞争和重复停止请求
@@ -359,8 +360,6 @@ class ASRProvider(ASRProviderBase):
                 "show_utterances": True,
                 "result_type": self.result_type,
                 "sequence": 1,
-                "boosting_table_name": self.boosting_table_name,
-                "correct_table_name": self.correct_table_name,
                 "end_window_size": self.end_window_size,
             },
             "audio": {
@@ -372,6 +371,18 @@ class ASRProvider(ASRProviderBase):
                 "sample_rate": self.rate,
             },
         }
+
+        # 热词表、替换词表放在 request 顶层会被豆包忽略，须放进 corpus；未配置的不发送
+        corpus = {
+            key: value
+            for key, value in (
+                ("boosting_table_name", self.boosting_table_name),
+                ("correct_table_name", self.correct_table_name),
+            )
+            if value
+        }
+        if corpus:
+            req["request"]["corpus"] = corpus
 
         # language参数仅在多语种模式下添加
         if self.enable_multilingual and self.language:
