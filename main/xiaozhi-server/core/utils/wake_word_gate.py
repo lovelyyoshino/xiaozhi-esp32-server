@@ -6,9 +6,11 @@
 
 @author pony
 @date 2026-11-12
-@version v1.0.0
-@last_modified 2026-11-12
+@version v1.0.2
+@last_modified 2026-11-14
 @changelog
+    - v1.0.2 (2026-11-14): 默认唤醒词加入“Hinova”“Heynova”（加热词后豆包把“Hi/Hey Nova”连写成一个词）
+    - v1.0.1 (2026-11-13): 默认唤醒词加入“小三”（豆包实测把“小蒜”识别成“小三”）
     - v1.0.0 (2026-11-12): 首尾唤醒词拼音模糊匹配，唤醒/提问后放行下一句，安全指令与按键说话免检
 """
 
@@ -19,7 +21,7 @@ from typing import Callable, Optional
 
 from pypinyin import Style, pinyin
 
-DEFAULT_WORDS = ("小蒜", "小帅", "Nova", "诺瓦")
+DEFAULT_WORDS = ("小蒜", "小帅", "小三", "Nova", "诺瓦", "Hinova", "Heynova")
 DEFAULT_GREETINGS = ("你好", "嗨", "hi", "hey", "hello")
 DEFAULT_HEAD_MAX_OFFSET = 2
 DEFAULT_TAIL_PARTICLES = "啊呀吧呢哈嘛哦啦呗"

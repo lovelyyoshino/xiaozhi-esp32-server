@@ -2,9 +2,11 @@
 
 @author pony
 @date 2026-11-12
-@version v1.0.0
-@last_modified 2026-11-12
+@version v1.0.2
+@last_modified 2026-11-14
 @changelog
+    - v1.0.2 (2026-11-14): 覆盖“Hinova”“Heynova”连写
+    - v1.0.1 (2026-11-13): 覆盖“小三”误写；句中提及的反例改为前缀更长的句子
     - v1.0.0 (2026-11-12): 覆盖首尾匹配、拼音模糊、安全指令、下一句免检时效及入口拦截
 """
 
@@ -66,9 +68,12 @@ def gate(clock):
         ("好的小蒜，帮我查下新闻", "好的，帮我查下新闻"),
         ("晓蒜给我讲一个笑话", "给我讲一个笑话"),
         ("再见，小帅。", "再见"),
+        ("小三，今天上海天气怎么样？", "今天上海天气怎么样？"),
         ("停下小蒜", "停下"),
         ("诺娃，现在几点", "现在几点"),
         ("hi Nova, what's the weather like today?", "what's the weather like today?"),
+        ("Hinova, what's the weather like today?", "what's the weather like today?"),
+        ("Heynova, tell me a joke.", "tell me a joke."),
         (
             "What's the weather like in Shanghai today, Nova?",
             "What's the weather like in Shanghai today?",
@@ -92,7 +97,7 @@ def test_wake_word_at_head_or_tail_is_stripped(matcher, text, expected):
         # 句中提及：旁人谈论机器人，不算对它说话
         "你看那个小蒜会导航",
         "我问你小蒜今天天气",
-        "这个小三真是的",
+        "你知道那个小三吗",
         "",
         "。？",
     ],
@@ -102,7 +107,7 @@ def test_no_wake_word_or_mid_sentence_mention_does_not_match(matcher, text):
 
 
 @pytest.mark.parametrize(
-    "text", ["你好小蒜", "小算。", "嘿，小蒜", "小蒜呀", "Hi, Nova.", "hi Nova", "Nova"]
+    "text", ["你好小蒜", "小算。", "嘿，小蒜", "小蒜呀", "Hi, Nova.", "hi Nova", "Nova", "Hinova."]
 )
 def test_name_only_is_wake_only(matcher, text):
     assert matcher.is_wake_only(text)
